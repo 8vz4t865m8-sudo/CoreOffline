@@ -22,30 +22,31 @@ jobs:
           xcrun -sdk iphoneos --show-sdk-version
 
       # ─────────────────────────────────────────────────────────
-      #  第一步：行为一致性检查
+      #  第一步：宿主对齐检查
       #
       #  ★ 这是本仓库最重要的一步。它逐条证明 src/CoreOffline.m
-      #    没有偏离用户的测试版二进制 —— 每一条断言都对应一段反汇编证据。
+      #    的接管点与宿主 Core 1.6 的真实结构一致 ——
+      #    每一条断言都对应一段反汇编证据（见 /workspace/卡密逆向/）。
       #    纯 Python，不需要 Xcode。
       # ─────────────────────────────────────────────────────────
-      - name: Parity check vs original test build
+      - name: Host parity check
         run: |
           set -e
           test -f src/CoreOffline.m || { echo "missing src/CoreOffline.m"; exit 1; }
-          python3 checks/clone_parity.py || { echo "❌ 复刻版偏离了测试版"; exit 1; }
+          python3 checks/host_parity.py || { echo "❌ 接管逻辑偏离宿主结构"; exit 1; }
 
       - name: Static sanity check
         run: |
           set -e
-          echo "── 断言：卡密那一套必须已经移出构建路径"
+          echo "── 断言：卡密那套「带副作用」的实现必须不在构建路径"
           for f in src/COEntry.m src/COVerifyBridge.m src/COKeychain.m \
                    src/COLicenseDialog.m src/COIcon.m sdk/T3Verify.m; do
             if [ -f "$f" ]; then
-              echo "❌ $f 还在构建路径里 —— 这一轮要求完全基于测试版，不含卡密"
+              echo "❌ $f 还在构建路径里"
               exit 1
             fi
           done
-          echo "✅ 构建路径干净（卡密已挪到 src/_license/ 留档）"
+          echo "✅ 构建路径干净（旧实现已挪到 src/_license/ 留档）"
 
           echo "── 断言：源文件只有一个"
           n=$(ls src/*.m 2>/dev/null | wc -l | tr -d ' ')
@@ -56,8 +57,30 @@ jobs:
           fi
           echo "✅ 只有一个编译单元"
 
+          echo "── 断言：禁止出现「自己调用 completion block」的写法"
+          # 上一版就是因为猜 block 签名而闪退（实测是 4 参数）
+          if grep -nE '\(\s*void\s*\(\s*\^\s*\)[^)]*\)\s*(completion|block)' src/CoreOffline.m; then
+            echo "❌ 检测到把 completion 强转成 block 再调用的写法"
+            exit 1
+          fi
+          echo "✅ 未自己调用任何 completion block"
+
+          echo "── 断言：禁止全局类遍历"
+          if grep -nE 'objc_copyClassList|objc_getClassList' src/CoreOffline.m; then
+            echo "❌ 使用了全局类遍历（dyld 阶段可能崩）"
+            exit 1
+          fi
+          echo "✅ 零全局类遍历"
+
+          echo "── 断言：禁止 Keychain / Security / 网络拦截"
+          if grep -nE 'SecItem(Add|CopyMatching|Delete)|NSURLSession|NSURLProtocol' src/CoreOffline.m; then
+            echo "❌ 引进了 Keychain / Security / 网络拦截 API"
+            exit 1
+          fi
+          echo "✅ 零 Keychain / Security / 网络拦截"
+
       - name: Build dylib
-        run: make ARCHS="arm64e"
+        run: make ARCHS="arm64 arm64e"
 
       - name: Verify Mach-O
         run: |
@@ -69,20 +92,13 @@ jobs:
           otool -L CoreOffline.work.dylib
 
           echo
-          echo "════════ 架构断言（必须 arm64e，与测试版一致）════════"
-          python3 - <<'PY'
-          import struct, sys
-          d = open("CoreOffline.work.dylib", "rb").read()
-          magic, cputype, cpusubtype = struct.unpack_from("<Iii", d, 0)
-          assert magic == 0xfeedfacf, "不是 64 位 Mach-O"
-          sub = cpusubtype & 0xFFFFFFFF
-          print("cputype=0x%x cpusubtype=0x%x" % (cputype, sub))
-          if sub != 0x80000002:
-              print("❌ cpusubtype=0x%x，期望 0x80000002 (arm64e)" % sub)
-              print("   测试版是 arm64e，编错架构在带 PAC 检查的环境下会注入异常")
-              sys.exit(1)
-          print("✅ arm64e (cpusubtype=0x80000002)")
-          PY
+          echo "════════ 架构断言（★ 必须双切片 arm64 + arm64e）════════"
+          # 宿主 Core 是 thin arm64e；编双切片保证任何设备都不会因架构被拒。
+          lipo -info CoreOffline.work.dylib
+          ARCHS=$(lipo -archs CoreOffline.work.dylib)
+          echo "$ARCHS" | grep -q "arm64"   || { echo "❌ 缺 arm64 切片"; exit 1; }
+          echo "$ARCHS" | grep -q "arm64e"  || { echo "❌ 缺 arm64e 切片"; exit 1; }
+          echo "✅ 双切片 arm64 + arm64e"
 
           echo
           echo "════════ install name 断言 ════════"
@@ -91,115 +107,74 @@ jobs:
           echo "✅ @executable_path/CoreOffline.work.dylib"
 
           echo
-          echo "════════ 依赖断言（★ 必须严格等于测试版的 3 个）════════"
+          echo "════════ 依赖断言（★ 只允许 Foundation + UIKit）════════"
           LIBS=$(otool -L CoreOffline.work.dylib | tail -n +2 | awk '{print $1}')
           echo "$LIBS"
-          for want in Foundation UIKit QuartzCore; do
+          for want in Foundation UIKit; do
             echo "$LIBS" | grep -q "$want.framework" \
               || { echo "❌ 缺 $want"; exit 1; }
           done
-          echo "✅ Foundation / UIKit / QuartzCore 齐全"
+          echo "✅ Foundation / UIKit 齐全"
 
           for bad in "Security.framework" "CFNetwork.framework" "CoreGraphics.framework" \
-                     "CoreTelephony.framework" "SystemConfiguration.framework"; do
+                     "CoreTelephony.framework" "SystemConfiguration.framework" \
+                     "CryptoKit.framework" "QuartzCore.framework"; do
             if echo "$LIBS" | grep -q "$bad"; then
-              echo "❌ 链了测试版没有的 $bad —— 会多一层 dyld 初始化，多一个闪退面"
+              echo "❌ 链了 $bad —— 会多一层 dyld 初始化，多一个闪退面"
               exit 1
             fi
           done
-          echo "✅ 没有多链任何框架（Security/CFNetwork/CoreGraphics 都没有）"
+          echo "✅ 没有多链任何框架"
 
           echo
-          echo "════════ 导出符号断言 ════════"
+          echo "════════ ★★★ 导出符号断言（宿主 dlsym 要找这 5 个）════════"
+          # 宿主的 5 个弱符号跳板，逐条对应：
+          #   0x100003400 CoreOfflineBootstrap   0x100003800 CoreRemoteOpen
+          #   0x100003500 CoreOfflinePrepare     0x100003900 CoreRemoteFault
+          #   0x100003600 CoreOfflineFinalize
           for sym in CoreOfflineBootstrap CoreOfflinePrepare CoreOfflineFinalize \
                      CoreRemoteOpen CoreRemoteFault; do
             nm -gU CoreOffline.work.dylib | grep -q "_$sym\$" \
-              || { echo "❌ 缺导出符号 _$sym"; exit 1; }
+              || { echo "❌ 缺导出符号 _$sym —— 宿主的 dlsym 会返回 NULL，接管不生效"; exit 1; }
           done
           echo "✅ CoreOfflineBootstrap / Prepare / Finalize / RemoteOpen / RemoteFault"
 
           echo
-          echo "════════ 卡密符号断言（★ 必须一个都没有）════════"
-          if nm -gU CoreOffline.work.dylib | grep -qiE "verify|license|keychain|t3|card"; then
-            echo "❌ 二进制里有卡密相关符号："
-            nm -gU CoreOffline.work.dylib | grep -iE "verify|license|keychain|t3|card"
-            exit 1
-          fi
-          echo "✅ 没有任何卡密相关符号"
-
-          echo
           echo "════════ Keychain 断言（必须没链上）════════"
           if nm -u CoreOffline.work.dylib | grep -q "_SecItem"; then
-            echo "❌ 链上了 SecItem* —— Security 框架被引进来了"
+            echo "❌ 链上了 SecItem* —— 自签下会返回 -34018"
             exit 1
           fi
           echo "✅ 没有 SecItem* 符号"
 
           echo
-          echo "════════ 关键字符串断言（测试版里真实存在的）════════"
-          for s in "2099-12-31 23:59:59" "OKDHomeMusicController" \
-                   "attachToRootView:" "refreshHomeLayoutArtwork" \
-                   "authorizationValue" "setDisableUpdateMask:" \
-                   "CoreHomeBanner.work" "api.appledb.dev" "fastly.jsdelivr.net"; do
+          echo "════════ 关键字符串断言 ════════"
+          for s in "qingxiugai.qingxiugai.qinxiugai" "2099-12-31 23:59:59" \
+                   "QXA117" "QXA140" "QXA141" "QxF4" \
+                   "finish:authorized:message:expiresAt:" \
+                   "verifyDeviceIdentifier:completion:" \
+                   "performPurpose:rootDeviceId:payload:completion:" \
+                   "inputCard:transfer:" "qxRefreshExpiry"; do
             strings -a CoreOffline.work.dylib | grep -q "$s" \
               || { echo "❌ 缺关键字符串: $s"; exit 1; }
           done
-          echo "✅ 关键字符串齐全"
+          echo "✅ 宿主类名 / 方法名 / 到期常量齐全"
 
           echo
-          echo "════════ 幽灵字符串断言（测试版里**不存在**的）════════"
-          # ★ 注意：openCommunity: 是 __objc_selrefs[3] 的**真实选择子名**，
-          #   必须保留。它恰好含 "Community"，所以这里要排除掉它再判。
-          GHOST=$(strings -a CoreOffline.work.dylib \
-                  | grep -E "Community|社区|交流群|官方频道" \
-                  | grep -v "^openCommunity:$" || true)
-          if [ -n "$GHOST" ]; then
-            echo "❌ 出现了测试版里不存在的标题："
-            echo "$GHOST"
+          echo "════════ 反模式断言（源码层面已查过，这里查二进制）════════"
+          # 卡密验证的「实现代码」不应该出现在我们的 dylib 里。
+          # 注意：QXA117 等只是**类名字符串**（用于 NSClassFromString），
+          # 不是我们实现了它们，所以允许出现。
+          if nm -u CoreOffline.work.dylib | grep -qE "_SecKeyCreateSignature|_CC_MD5|_CC_SHA256"; then
+            echo "❌ 引用了签名/哈希函数 —— 说明把卡密计算引进来了"
+            nm -u CoreOffline.work.dylib | grep -E "_SecKeyCreateSignature|_CC_MD5|_CC_SHA256"
             exit 1
           fi
-          echo "✅ 没有幽灵标题（openCommunity: 已排除，它是真实选择子名）"
-
-          echo
-          echo "════════ 按钮标题断言（★ 必须是那 5 个中文词）════════"
-          # ★ 两个注意点：
-          #   ① macOS 的 strings **不支持** -e l（那是 GNU binutils 的选项，
-          #      Xcode 自带的会直接报 unknown flag）。所以用 Python 直接搜字节。
-          #   ② 测试版把这 5 个标题放在 __ustring（UTF-16LE），但 clang 编
-          #      @"..." 字面量时可能选 UTF-8。**两种编码都接受**，只要有一份在。
-          python3 - <<'PY'
-          import sys
-          data = open("CoreOffline.work.dylib", "rb").read()
-          titles = ["查看公告", "提交工单", "工单进度", "激活续时", "检查更新"]
-          missing = []
-          for t in titles:
-              has_u16 = t.encode("utf-16-le") in data
-              has_u8 = t.encode("utf-8") in data
-              if not has_u16 and not has_u8:
-                  missing.append(t)
-          if missing:
-              print("❌ 缺按钮标题（UTF-16LE / UTF-8 都没有）: %s" % missing)
-              sys.exit(1)
-          print("✅ 查看公告 / 提交工单 / 工单进度 / 激活续时 / 检查更新")
-          PY
-
-          echo
-          echo "════════ 幽灵标题断言（双编码保险）════════"
-          python3 - <<'PY'
-          import sys
-          data = open("CoreOffline.work.dylib", "rb").read()
-          ghosts = ["社区", "交流群", "官方频道", "联系客服"]
-          hit = [g for g in ghosts
-                 if g.encode("utf-16-le") in data or g.encode("utf-8") in data]
-          if hit:
-              print("❌ 出现了测试版里不存在的标题: %s" % hit)
-              sys.exit(1)
-          print("✅ 没有幽灵标题")
-          PY
+          echo "✅ 没有引用签名/哈希函数"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CoreOffline.work.dylib
+          name: CoreOffline-work-dylib
           path: CoreOffline.work.dylib
           if-no-files-found: error

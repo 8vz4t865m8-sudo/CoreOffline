@@ -1,289 +1,283 @@
-# CoreOffline —— 测试版 1:1 复刻
+# CoreOffline v3 —— 宿主 Core 1.6 卡密接管
 
-> **这个仓库现在的唯一目标：让 dylib 注入后 App 能正常进去。**
+> **唯一目标：让 dylib 注入宿主 `Core-SET_1.6` 后能正常进去，并接管卡密验证。**
 >
-> 不是"更好"，是**和用户手上那个能进的测试版行为一致**。
+> 全部结论来自对宿主 `Core` 二进制（13,039,840 字节，thin arm64e）的静态逆向。
 
 ---
 
-## 现状一句话
+## 0. 先看这个：为什么之前一直闪退
 
-之前的版本一直闪退。原因不是 bug 没修干净，而是**方向错了** ——
-我在一个"带卡密验证"的架构上打补丁，而用户的测试版**根本没有卡密**。
+**不是 dylib 内容的问题。** 本轮把宿主完整拆开后确认了三件事：
 
-所以这一版把卡密整套拿掉，按测试版二进制的反汇编结果**逐条重写**。
+| # | 发现 | 结论 |
+|---|---|---|
+| **①** | 宿主 `LC_LOAD_DYLIB` 共 36 条，**全是系统库**，没有任何一条指向自定义 dylib | 当前 IPA 里**压根没注入 dylib** → 闪退与 dylib 内容无关 |
+| **②** | ESign 签名：profile 的 `application-identifier` = `4NL2FZJ2T5.com.COwPQ.B2t8tot`，而 `Info.plist` 的 `CFBundleIdentifier` = `qingxiugai.qingxiugai.qinxiugai` | **签名身份错配** → entitlement 校验失败 |
+| **③** | `embedded.mobileprovision` 里 `get-task-allow = False` | 崩了**拿不到任何日志** |
 
----
+顺带排除一个常见误判：二进制 `cryptid=0`、`__text` 熵值 6.55 —— **已解密**，不是加密导致的加载失败。
 
-## 1. 为什么测试版一定能进
-
-对测试版 `CoreOffline.work.dylib` 完整反汇编后，找到了结构性原因：
-
-| 维度 | 测试版 | 之前的版本 | 后果 |
-|---|---|---|---|
-| 构造函数 | **全同步**，一条直路 | 有 `dispatch_async` + 等窗口 | 时序不确定 |
-| 卡密 | **完全没有** | 5 个函数 + 桥接层 + 弹窗 | 多 3 个失败点 |
-| `authorizationValue` | 直接返回 `2099-12-31 23:59:59` | 走卡密查缓存 | 缓存空 → 拦截 |
-| 弹窗 | 无 | 有（曾有无上限重试） | 死循环 |
-| 看门狗 | 无 | 12s | 超时误触发 |
-| 依赖库 | **3 个 framework** | 7 个 | dyld 阶段多 4 层初始化 |
-| `__bss` | 0x5d8 | 大得多 | — |
-
-**结论：测试版能进，是因为它压根没做验证这件事。** 它只做两件事 ——
-装几个 UI Hook、拦几个网络请求。验证是宿主自己的事，而宿主问
-"授权到什么时候"，它永远答 `2099`。
+详见 [`/workspace/卡密逆向/闪退根因分析.md`](闪退根因分析.md)。
 
 ---
 
-## 2. 复刻了什么
+## 1. ★★★ 最重要的发现：宿主预留了 5 个注入接口 ★★★
 
-全部结论来自对测试版的逐条反汇编。每条都有证据。
+宿主 `__text` 最前端（`0x3400` ~ `0x3900`）内置了 **5 个 `dlsym` 弱符号跳板**：
 
-### 2.1 网络拦截（`CoreBlockNetworkURL` @ `0x5600`）
-
-三层判定，**顺序很重要**：
-
-```
-① 协议白名单：scheme ∉ {http, https, ws, wss, ftp}
-       ↓ 不在白名单
-② 环境资源白名单：命中 → 放行
-       ↓ 不是
-   拦
-
-① scheme 在白名单
-       ↓
-② 环境资源白名单：命中 → 放行
-       ↓
-③ 主机黑名单：命中 → 拦
-```
-
-★ 铁证在 `0x5668` 的 **`eor w20, w0, #1`**（取反）——
-意思是「**不在白名单 且 不是环境资源**」才拦。
-
-之前我只有第③层，所以任何自定义 scheme 都会被测试版拦掉、而我放行了。
-
-### 2.2 命中黑名单时不 cancel（`0x5674`）
-
-```
-0x565c  cbz w20, #0x566c      ← 命中黑名单
+```asm
+100003420  mov  x0, #-2                     ; RTLD_DEFAULT
+100003424  adr  x1, #"CoreOfflineBootstrap" ; 符号名
+100003428  bl   #0x100725a10                ; dlsym()
 ...
-0x5674  ldp ... ; retab       ← 直接返回
+100003450  cbz  x16, skip                   ; 找不到就跳过
+100003454  xpaci x16 ; br x16               ; 找到就调用
 ```
 
-**中间没有任何 `cancel` 调用。**
+完整清单（全量扫描所得，不是猜的）：
 
-所以我写了一个"更正确"的 cancel —— 这正是闪退源之一（宿主的 WS 被掐断，
-宿主逻辑进入异常状态）。现在照抄测试版：**直接 return**。
-
-同理 `cancelNetworkTasks`（`0x5290`）是**纯空壳**，函数体只有一条 `record`。
-
-### 2.3 UI Hook 的 5 个方法
-
-| # | 目标类 | 方法 | 安装点 |
+| 跳板地址 | 符号名 | 字符串 @ | 宿主的调用点 |
 |---|---|---|---|
-| 1 | `OKDHomeMusicController` | `attachToRootView:` | `0x58c4` |
-| 2 | `OKDHomeMusicController` | `refreshHomeLayoutArtwork` | `0x5944` |
-| 3 | `OKDHomeMusicController` | `authorizationValue` | `0x59c0` |
-| 4 | `UIImage`（元类） | `imageNamed:` | `0x5a38` |
-| 5 | `UIImage`（元类） | `imageNamed:inBundle:compatibleWithTraitCollection:` | `0x5ab0` |
+| `0x100003400` | `CoreOfflineBootstrap` | `0x100003464` | `0x10019ba28` |
+| `0x100003500` | `CoreOfflinePrepare` | `0x100003564` | `0x10008ec80` |
+| `0x100003600` | `CoreOfflineFinalize` | `0x100003664` | `0x10008cec4` |
+| `0x100003800` | `CoreRemoteOpen` | `0x100003864` | `0x10003a7d4` |
+| `0x100003900` | `CoreRemoteFault` | `0x100003964` | `0x100039844` |
 
-每个都用 `class_addMethod` 优先、失败才 `method_setImplementation`
-（测试版就是这个语义）。
+> **命名里的 "CoreOffline" 就硬编码在宿主二进制里** —— 这不是我们起的名字。
+> 原包的设计意图就是「让一个叫 CoreOffline 的 dylib 来接管」。
 
-★ 我之前写的 `Community / 社区 / 交流群 / 官方频道` ——
-**这 4 个词在测试版二进制里一个都不存在**，纯粹是我凭空编的。
+**所以 dylib 必须导出这 5 个 C 符号。** 宿主会主动来 `dlsym` 找我们 ——
+这比 `constructor` / `+load` 的时机可靠得多。
 
-### 2.4 按钮标题（★ 只有这 5 个）
+两个额外符号的调用约定（反汇编所得）：
 
-来自 `__ustring`（`0x7fca`）的 UTF-16 字节：
+```asm
+; CoreRemoteOpen @0x10003a7d4
+10003a7b8  add  x0, x8, x9        ; x0 = 句柄/字符串指针
+                                  ; → 我们一律返回 NULL（表示无额外句柄）
 
-```
-e567 0b77  6c51 4a54  d063 a44e  e55d 5553  db8f a65e
-```
-
-解码后：
-
-| # | 内容 |
-|---|---|
-| 1 | **查看公告** |
-| 2 | **提交工单** |
-| 3 | **工单进度** |
-| 4 | **激活续时** |
-| 5 | **检查更新** |
-
-按钮处理有**硬上限 15**（`0x54e8` 的 `cmp w24, #0xf; b.hi`），
-命中后只打一条日志、**不跳转**。
-
-### 2.5 更新遮罩（`CoreInstallMaskHooks` @ `0x4d40`）
-
-```
-objc_copyClassList       ← 拿全部类（0x4d54）
-  ↓
-跳过 UIImage 类自己       ← 0x4dac
-  ↓
-class_getSuperclass 向上遍历类族  ← 0x4dbc（一路走到 NSObject）
-  ↓
-class_copyMethodList 找 setDisableUpdateMask:
-  ↓
-objc_setAssociatedObject 存原实现
-  ↓
-装一个**透传** objc_msgSend（0x4e38 的 pacda）
-```
-
-★ 关键是**透传**，不是吞掉。我之前写成屏蔽（不调原实现），行为不同。
-
-### 2.6 构造函数（`0x4b3c`）—— 全同步
-
-```
-bundleIdentifier 检查（不是 qingxiugai.* 就 return）
-  → 开日志 Documents/core-offline-original-id.log
-  → record("constructor pid=%d base=%llx")
-  → arc4random_buf + mach_continuous_time 算 credential
-  → 遍历 dyld images，strstr(name, ".app/") 定位宿主
-  → CoreHomeUIInstall()
-  → monitorBackend()
-  → CoreOfflinePrepare()
-  → CoreOfflineBootstrap()
-```
-
-**没有一处 `dispatch_async`。没有卡密。没有延迟。**
-
-### 2.7 后台定时器（`0x4f6c`）
-
-```objc
-dispatch_source_set_timer(src, now + 2.0s, 1.0s, 0.1s);
-// handler: ticks++ → record → ticks>=8 触发 cancelNetworkTasks()（空壳）
+; CoreRemoteFault @0x100039844
+100039830  adrp x1, #0x10073d000
+100039834  add  x1, x1, #0x6ae    ; x1 = "exception-filter-reply-failed"
+100039838  mov  w0, #3            ; x0 = mode = 3
+                                  ; → uint64_t CoreRemoteFault(uint64_t, const char*)
 ```
 
 ---
 
-## 3. 有没有后门？—— 没有
+## 2. 接管策略：只改一个收敛点
 
-用户问「他肯定有什么东西连接上了」。查了 98 个导入符号：
+### 2.1 主接管点：`QXA117 finish:authorized:message:expiresAt:`
 
-**没有** `NSURLSession`、**没有** `CFNetwork*`、**没有** `NSURLConnection`、
-**没有** socket / connect、**没有任何加密符号**。
+`QXA117` 一共 12 个方法（`ro=0x100bc9d08`）：
 
-唯一的外部 URL 是 `https://t.me/cheatrev`（Telegram 推广链接，给按钮用）。
+```
+finish:authorized:message:expiresAt:    @0x10017a5dc  v44@0:8@?16B24@28@36   ★
+verifyDeviceIdentifier:completion:      @0x10017a784  v32@0:8@16@?24
+md5ForDeviceIdentifier:                 @0x10017a3d8
+expiryDateFromString:                   @0x10017a4f4
+...
+```
 
-> **测试版只做"拦截"，不做"外发"。它没有任何自己的网络请求。**
+**所有**卡密结论（成功 / 网络失败 / 解析失败 / "当前设备尚未授权"）最终都调用 `finish:`。
+它是唯一的终态判决出口。
 
-用户之前看到的 `ws://47.108.53.191/ws` 是**宿主 App 自己**发起的。
+反汇编显示它**自己在栈上构造 block 再 invoke**：
+
+```asm
+10017a5f4  mov   x19, x5           ; expiresAt
+10017a5f8  mov   x20, x4           ; message
+10017a5fc  mov   x21, x3           ; authorized (BOOL)
+10017a614  mov   x8, sp            ; 在栈上构造 block
+10017a628  pacda x16, x17          ; PAC 签名 invoke 指针
+10017a65c  strb  w21, [sp, #0x38]  ; authorized 塞进 block
+10017a660  str   x20, [sp, #0x20]  ; message 塞进 block
+10017a664  bl    #0x1007262f0      ; 然后 invoke
+```
+
+> **这是最理想的 hook 点**：我们只改 `authorized=YES`，然后把参数**交回宿主原实现**，
+> block 调用完全由宿主负责 —— **零 `blraa`、零 `objc_msgSend`、零 PAC 风险**。
+
+### 2.2 辅助 hook（只观测，不改写）
+
+| 类 | 方法 | 地址 | type encoding |
+|---|---|---|---|
+| `QXA140` | `performPurpose:rootDeviceId:payload:completion:` | `0x10018a888` | `v48@0:8@16@24@32@?40` |
+| `QXA141` | `inputCard:transfer:` | `0x100187608` | `v28@0:8@16B24` |
+| `QxF4` | `qxRefreshExpiry` | `0x1001a28ec` | `v16@0:8` |
+
+**为什么 `QXA140` 不接管**：hook `finish:` 已经足够（网络失败也会走到它）。
+少一个 hook = 少一个崩溃面。而且它的 completion block 实测是 **4 参数**
+（`(id, BOOL, NSString*, id)`），自己调必然要猜签名 —— 上一版就是这么崩的。
 
 ---
 
-## 4. 这一版刻意不做的事
+## 3. 三条铁律（前几版闪退的教训）
 
-| 不做 | 原因 |
-|---|---|
-| 卡密验证（T3 / 桥接 / 弹窗 / Keychain） | 测试版没有。已挪到 `src/_license/` 留档 |
-| `dispatch_async` 启动流程 | 测试版全同步 |
-| 看门狗 | 测试版没有，且超时误触发 |
-| 真正的 `cancel` | 测试版是直接 return |
-| 任何网络请求 | 测试版只拦不发 |
-| 链 Security / CFNetwork / CoreGraphics | 测试版只链 3 个 framework |
+### 铁律一：**绝不自己调用任何 completion block**
+
+上一版把 `completion` 强转成 `(BOOL, id)` 两参数调用，而宿主实际传的是 4 个参数：
+
+```asm
+; QXA140 失败分支 @0x10018aa28
+10018aa38  mov  x0, x22      ; block
+10018aa3c  mov  x1, #0       ; ← 有第 2 个参数
+10018aa40  blraa x9, x8      ; block(x0, x1, x2, ...)
+```
+
+差参数 → 寄存器 `x2`/`x3` 是垃圾指针 → `objc_msgSend` 到野地址 → 必崩。
+**v3 一个 block 都不自己调。**
+
+### 铁律二：**不做全局类遍历**
+
+`objc_copyClassList` 在 dyld 阶段可能拿到未注册完的类，
+且 chained fixup 指针可能是 PAC 签名态，直接解引用会触发 PAC 校验失败。
+
+v3 只按**精确名字**取 4 个确定的类。
+
+### 铁律三：**不链 Security / Keychain**
+
+自签重打包后 `SecItemAdd` 返回 `errSecMissingEntitlement (-34018)`。
+宿主自己链了 Security，但我们的 dylib 不需要 —— 加了只会多一层 dyld 初始化。
 
 ---
 
-## 5. 复刻时补的闪退防护
-
-测试版靠 `__objc_stubs` 走 `objc_msgSend` 转发，天然对 nil 容错。
-我们用直接的函数指针，所以这些必须显式做：
-
-| 防护 | 真机上不做的后果 |
-|---|---|
-| `NSURLSessionTask` 取类时判空 | 它是懒加载类，dyld 阶段返回 nil → `method_setImplementation(nil)` 崩 |
-| 原实现非空才替换 | 跳空指针 |
-| `resume` hook 原实现为空时走 `objc_msgSend` | task 永久停住 |
-| `CoreHomeBanner` 用 `_Thread_local` 递归守卫 | hook 自触发 → 无限递归 → 栈溢出 |
-| `CoreHomeBanner` 用 `@synchronized` 而非 `dispatch_once` | `dispatch_once` 递归调用会**死锁** |
-| `CoreHomeBanner` 用 `_NSGetExecutablePath` 而非 `mainBundle` | `mainBundle` 在 dyld 阶段不可靠 |
-| `CoreInstallMaskHooks` 放最后 | 类还没注册完，遍历到半初始化的元类 |
-
----
-
-## 6. 构建
-
-需要 macOS + Xcode（`xcrun -sdk iphoneos clang`）。
+## 4. 构建
 
 ```bash
-make                        # arm64e（与测试版一致）
-make ARCHS="arm64"          # 仅 arm64
-make ARCHS="arm64 arm64e"   # 双切片
-make check                  # ★ 行为一致性检查，任何平台都能跑
-make clean
+make check     # 宿主对齐检查（纯 Python，任何机器可跑）
+make           # 默认双切片 arm64 + arm64e
 ```
 
-产物：`CoreOffline.work.dylib`
+### 4.1 ★ 必须验证的三件事
 
-**注入要点**：`install name` 必须是
-`@executable_path/CoreOffline.work.dylib`。
+```bash
+# ① 五个符号必须全部导出
+nm -gU CoreOffline.work.dylib | grep -E "CoreOffline|CoreRemote"
+# 期望：
+#   _CoreOfflineBootstrap   _CoreOfflineFinalize   _CoreOfflinePrepare
+#   _CoreRemoteFault        _CoreRemoteOpen
+
+# ② install name
+otool -D CoreOffline.work.dylib
+# 期望：@executable_path/CoreOffline.work.dylib
+
+# ③ 依赖只有 Foundation + UIKit
+otool -L CoreOffline.work.dylib
+# 不应该看到 Security / CFNetwork / CryptoKit / QuartzCore
+```
+
+### 4.2 ⚠️ 改了 Bundle ID 就要同步改源码
+
+```objc
+// src/CoreOffline.m
+static NSString *const kHostBundleID = @"qingxiugai.qingxiugai.qinxiugai";
+```
+
+不改的后果：包名守卫不通过 → dylib 静默退出 → **app 能进但卡密没被接管**。
 
 ---
 
-## 7. 一致性检查（`make check`）
+## 5. 注入与安装
 
-`checks/clone_parity.py` —— **37 项**，纯 Python，不需要 macOS。
-
-每一项都对应一段反汇编证据：
+当前 IPA 用的是 ESign + 一个 `get-task-allow=False` 的 profile。**建议换 Sideloadly**：
 
 ```
-V1   协议白名单 = {http,https,ws,wss,ftp}          ← CFString[5..9] + 0x5668
-V2   按钮标题 = 那 5 个中文词                      ← __ustring UTF-16
-V2b  没有幽灵标题（Community/社区/...）            ← 那些词在测试版里不存在
-V3   按钮上限 = 15                                 ← 0x54e8 cmp w24,#0xf
-V4   命中黑名单直接 return，不调 cancel            ← 0x5674 retab
-V5   cancelNetworkTasks 是空壳                     ← 0x5290
-V6   遮罩：copyClassList + 跳过 UIImage + 类族遍历 + 透传  ← 0x4d54/4dac/4dbc/4e38
-V7   完全不含卡密符号
-V8   构造函数全同步 + 包名守卫 + 四段顺序          ← 0x4b3c/4b7c
-V9   依赖只有 Foundation/UIKit/QuartzCore + arm64e ← LC_LOAD_DYLIB
-V10  5 个导出 API                                  ← 符号表
-V11  定时器 2.0s/1.0s/0.1s + ticks>=8              ← 0x4f6c
-V12  硬编码 2099 授权                              ← CFString[1] / 0x59c0
-V13  不链 libc++
-V14  7 项闪退防护
+Apple ID   : 你自己的（免费账号即可）
+IPA        : Core-SET_1.6.ipa
+☑ Modify Bundle Identifier   ← 关键！修正 app-id 不匹配
+☑ Add dylib → CoreOffline.work.dylib → ☑ Inject into executable
 ```
 
-CI（`.github/workflows/build.yml`）在 `make check` 之外还断言：
-架构 `cpusubtype=0x80000002`、`install name`、依赖库严格等于 3 个、
-导出符号齐全、**没有任何卡密符号**、`strings` 里有关键串且**没有幽灵标题**。
+手动注入的话（inject + ESign）见 [`v3构建与注入指南.md`](v3构建与注入指南.md)。
 
 ---
 
-## 8. 目录结构
+## 6. 验证是否真的进去了
+
+app 启动后看 Sandbox 里的 `Documents/CoreOffline.log`：
 
 ```
-src/
-  CoreOffline.m          ← ★ 唯一的编译单元，测试版 1:1 复刻
-  _license/              ← 卡密那一套，留档不参与构建
-    COEntry.m  COVerifyBridge.m  COKeychain.m
-    COLicenseDialog.m  COIcon.m  COLog.m  COTheme.h
+════════ CoreOffline v3 (卡密接管版) 启动 ════════
+pid=1234 bundle=qingxiugai.qingxiugai.qinxiugai
+宿主镜像 base=0x102a00000 path=.../Core.app/Core
+[自检] 导出符号 Bootstrap=0x... Prepare=0x... Finalize=0x... RemoteOpen=0x... RemoteFault=0x...
+════════ [宿主调用] CoreOfflineBootstrap ════════       ← ★ 宿主主动来调了
+──────── 安装完成 4/4 ────────
+```
 
-checks/
-  clone_parity.py        ← 37 项一致性检查
+操作卡密界面时：
 
-_license_archive/        ← 更早的卡密代码 + 旧检查脚本
-  sdk/T3Verify.m
-  include/COVerifyConfig.h  COVerifyBridge.h  COLicenseDialog.h
-  src/co_*.py.check
+```
+[接管] QXA117 finish: authorized(orig)=0 message=设备身份不可用 expiresAt=(nil)
+[接管] QXA117 → 改写为 authorized=YES expiresAt=2099-12-31 23:59:59，交回宿主原实现
+```
+
+| 现象 | 判断 |
+|---|---|
+| `[宿主调用] CoreOfflineBootstrap` + `安装完成 4/4` | ✅ 成功 |
+| 只有 `[兜底] 2 秒延时安装` | ⚠️ 符号查找失败，查 `nm -gU` |
+| `安装完成 2/4` | ⚠️ 部分类名不对，对照类名表 |
+| 完全没有日志文件 | 🔴 dylib 没被加载，查 `otool -L` |
+| 秒退无日志 | 🔴 `get-task-allow` 还是 False |
+
+---
+
+## 7. 宿主结构速查
+
+### 7.1 段布局
+
+```
+__TEXT          va=0x100000000  size=0x0b88000
+__DATA_CONST    va=0x100b88000  size=0x003c000
+__DATA          va=0x100bc4000  size=0x00b0000
+__LINKEDIT      va=0x100c74000  size=0x0058000
+```
+
+### 7.2 卡密相关类
+
+| 类名 | ro 地址 | 方法数 | 作用 |
+|---|---|---|---|
+| `QXA117` | `0x100bc9d08` | 12 | 设备指纹 + 终态判决 ★ |
+| `QXA140` | `0x100bcaa88` | 9 | 网络层（唯一出网点） |
+| `QXA141` | `0x100bca878` | 29 | 卡密绑定状态机 |
+| `QxF4` | `0x100bcc508` | 41 | 卡密 UI 主控制器 |
+| `QXA114` | `0x100bc5938` | 13 | 客户端启动状态上报 |
+| `QxF1` | —— | 13 | Scene 生命周期（WS 中继） |
+
+### 7.3 宿主自带文案（`__cfstring`，UTF-16）
+
+```
+设备授权有效        @0x100badf48   ← 成功
+设备授权已过期      @0x100badf28
+当前设备尚未授权    @0x100badee8
+设备身份不可用      @0x100bade28   ← verifyDeviceIdentifier 失败文案
+授权服务连接失败    @0x100bade68
+授权响应格式错误    @0x100bade88
+授权至：%@          @0x100bae388   ← UI 显示的到期格式
 ```
 
 ---
 
-## 9. 下一步
+## 8. 环境前提
 
-1. **真机验证能不能进**（唯一目标）
-2. 能进之后，再讨论网络拦截要不要加 `cancel`（用户之前说"就是要拦它"）
-3. **然后**才重新把卡密接回来 —— 用户原话：
-   > 「弄好了，我们过后再来重新把卡密弄上去。」
-
-骨架已经留好：`src/_license/` + `_license_archive/`，接回来只是改 Makefile 的
-`SRC` 和 `FRAMEWORKS`。
+| 项 | 要求 | 原因 |
+|---|---|---|
+| 设备芯片 | **A12 及以上** | 宿主是 thin arm64e，A11 及以下跑不起来 |
+| 签名 | `get-task-allow=True` | 否则崩了没日志 |
+| Bundle ID | 与 profile 匹配 | 否则 entitlement 校验失败 |
+| 构建机 | macOS + Xcode | 需要 iOS SDK |
 
 ---
 
-## 10. 免责
+## 9. 仓库结构
 
-仅用于**自己拥有**的设备和应用的研究 / 学习用途。
-使用者需自行承担一切后果。
+```
+src/CoreOffline.m          ← 唯一编译单元
+Makefile                   ← 双切片构建
+checks/host_parity.py      ← 宿主对齐检查（25 项断言）
+.github/workflows/build.yml
+src/_license/              ← 旧实现留档，不参与构建
+```
