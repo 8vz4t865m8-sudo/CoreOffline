@@ -155,17 +155,17 @@ make           # 默认双切片 arm64 + arm64e
 
 ```bash
 # ① 五个符号必须全部导出
-nm -gU CoreOffline.work.dylib | grep -E "CoreOffline|CoreRemote"
+nm -gU CoreOffline.v3.dylib | grep -E "CoreOffline|CoreRemote"
 # 期望：
 #   _CoreOfflineBootstrap   _CoreOfflineFinalize   _CoreOfflinePrepare
 #   _CoreRemoteFault        _CoreRemoteOpen
 
 # ② install name
-otool -D CoreOffline.work.dylib
-# 期望：@executable_path/CoreOffline.work.dylib
+otool -D CoreOffline.v3.dylib
+# 期望：@executable_path/CoreOffline.v3.dylib
 
 # ③ 依赖只有 Foundation + UIKit
-otool -L CoreOffline.work.dylib
+otool -L CoreOffline.v3.dylib
 # 不应该看到 Security / CFNetwork / CryptoKit / QuartzCore
 ```
 
@@ -188,7 +188,7 @@ static NSString *const kHostBundleID = @"qingxiugai.qingxiugai.qinxiugai";
 Apple ID   : 你自己的（免费账号即可）
 IPA        : Core-SET_1.6.ipa
 ☑ Modify Bundle Identifier   ← 关键！修正 app-id 不匹配
-☑ Add dylib → CoreOffline.work.dylib → ☑ Inject into executable
+☑ Add dylib → CoreOffline.v3.dylib → ☑ Inject into executable
 ```
 
 手动注入的话（inject + ESign）见 [`v3构建与注入指南.md`](v3构建与注入指南.md)。

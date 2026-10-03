@@ -100,30 +100,30 @@ jobs:
       - name: Verify Mach-O
         run: |
           set -e
-          otool -hv CoreOffline.work.dylib
+          otool -hv CoreOffline.v3.dylib
           echo "── install name:"
-          otool -D CoreOffline.work.dylib
+          otool -D CoreOffline.v3.dylib
           echo "── linked frameworks:"
-          otool -L CoreOffline.work.dylib
+          otool -L CoreOffline.v3.dylib
 
           echo
           echo "════════ 架构断言（★ 必须双切片 arm64 + arm64e）════════"
           # 宿主 Core 是 thin arm64e；编双切片保证任何设备都不会因架构被拒。
-          lipo -info CoreOffline.work.dylib
-          ARCHS=$(lipo -archs CoreOffline.work.dylib)
+          lipo -info CoreOffline.v3.dylib
+          ARCHS=$(lipo -archs CoreOffline.v3.dylib)
           echo "$ARCHS" | grep -q "arm64"   || { echo "❌ 缺 arm64 切片"; exit 1; }
           echo "$ARCHS" | grep -q "arm64e"  || { echo "❌ 缺 arm64e 切片"; exit 1; }
           echo "✅ 双切片 arm64 + arm64e"
 
           echo
           echo "════════ install name 断言 ════════"
-          otool -D CoreOffline.work.dylib | grep -q "@executable_path/CoreOffline.work.dylib" \
+          otool -D CoreOffline.v3.dylib | grep -q "@executable_path/CoreOffline.v3.dylib" \
             || { echo "❌ install name 不对，注入后 dyld 找不到"; exit 1; }
-          echo "✅ @executable_path/CoreOffline.work.dylib"
+          echo "✅ @executable_path/CoreOffline.v3.dylib"
 
           echo
           echo "════════ 依赖断言（★ 只允许 Foundation + UIKit）════════"
-          LIBS=$(otool -L CoreOffline.work.dylib | tail -n +2 | awk '{print $1}')
+          LIBS=$(otool -L CoreOffline.v3.dylib | tail -n +2 | awk '{print $1}')
           echo "$LIBS"
           for want in Foundation UIKit; do
             echo "$LIBS" | grep -q "$want.framework" \
@@ -149,14 +149,14 @@ jobs:
           #   0x100003600 CoreOfflineFinalize
           for sym in CoreOfflineBootstrap CoreOfflinePrepare CoreOfflineFinalize \
                      CoreRemoteOpen CoreRemoteFault; do
-            nm -gU CoreOffline.work.dylib | grep -q "_$sym\$" \
+            nm -gU CoreOffline.v3.dylib | grep -q "_$sym\$" \
               || { echo "❌ 缺导出符号 _$sym —— 宿主的 dlsym 会返回 NULL，接管不生效"; exit 1; }
           done
           echo "✅ CoreOfflineBootstrap / Prepare / Finalize / RemoteOpen / RemoteFault"
 
           echo
           echo "════════ Keychain 断言（必须没链上）════════"
-          if nm -u CoreOffline.work.dylib | grep -q "_SecItem"; then
+          if nm -u CoreOffline.v3.dylib | grep -q "_SecItem"; then
             echo "❌ 链上了 SecItem* —— 自签下会返回 -34018"
             exit 1
           fi
@@ -173,7 +173,7 @@ jobs:
                    "finish:authorized:message:expiresAt:" \
                    "performPurpose:rootDeviceId:payload:completion:" \
                    "inputCard:transfer:" "qxRefreshExpiry"; do
-            strings -a CoreOffline.work.dylib | grep -q "$s" \
+            strings -a CoreOffline.v3.dylib | grep -q "$s" \
               || { echo "❌ 缺关键字符串: $s"; exit 1; }
           done
           echo "✅ 宿主类名 / 方法名（4 个接管点）/ 到期常量齐全"
@@ -181,7 +181,7 @@ jobs:
           # 反向断言：已废弃的 hook 目标不能回到二进制里，
           # 否则说明源码被改回了 v2 的旧路径（那个版本会自己调 block → 闪退）。
           for s in "verifyDeviceIdentifier:completion:"; do
-            if strings -a CoreOffline.work.dylib | grep -q "$s"; then
+            if strings -a CoreOffline.v3.dylib | grep -q "$s"; then
               echo "❌ 出现已废弃的选择器: $s —— 源码可能被改回了 v2 路径"
               exit 1
             fi
@@ -193,9 +193,9 @@ jobs:
           # 卡密验证的「实现代码」不应该出现在我们的 dylib 里。
           # 注意：QXA117 等只是**类名字符串**（用于 NSClassFromString），
           # 不是我们实现了它们，所以允许出现。
-          if nm -u CoreOffline.work.dylib | grep -qE "_SecKeyCreateSignature|_CC_MD5|_CC_SHA256"; then
+          if nm -u CoreOffline.v3.dylib | grep -qE "_SecKeyCreateSignature|_CC_MD5|_CC_SHA256"; then
             echo "❌ 引用了签名/哈希函数 —— 说明把卡密计算引进来了"
-            nm -u CoreOffline.work.dylib | grep -E "_SecKeyCreateSignature|_CC_MD5|_CC_SHA256"
+            nm -u CoreOffline.v3.dylib | grep -E "_SecKeyCreateSignature|_CC_MD5|_CC_SHA256"
             exit 1
           fi
           echo "✅ 没有引用签名/哈希函数"
@@ -203,6 +203,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CoreOffline-work-dylib
-          path: CoreOffline.work.dylib
+          name: CoreOffline-v3-dylib
+          path: CoreOffline.v3.dylib
           if-no-files-found: error

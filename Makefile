@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────
-#  CoreOffline v2 —— 宿主 Core-SET_1.6 卡密接管
+#  CoreOffline v3 —— 宿主 Core-SET_1.6 卡密接管
 #
 #  构建（需 macOS + Xcode）：
 #     make                          # 默认双切片 arm64 + arm64e
@@ -8,9 +8,10 @@
 #     make check                    # 行为一致性检查（不需要 macOS）
 #     make clean
 #
-#  产物：CoreOffline.work.dylib
-#  注入要点：install name 必须是 @executable_path/CoreOffline.work.dylib，
+#  产物：CoreOffline.v3.dylib
+#  注入要点：install name 必须是 @executable_path/CoreOffline.v3.dylib，
 #           这样 insert_dylib 插进宿主后能被 dyld 正确解析。
+#           ★ install name 与文件名保持一致 —— 别只改一半。
 #
 #  ★ 关于 arm64e：
 #    只写 `-arch arm64e` 编出来的 cpusubtype 是 0x0（= 普通 arm64），
@@ -18,7 +19,7 @@
 #    0x80000002（arm64e，带 PAC）。
 #    而 `-target` 一次只能指定一个架构，所以多架构走「分别编译 + lipo」。
 #
-#  ★★ 关于接管策略（v2 的核心修正）：
+# ★★ 关于接管策略（v3 的核心修正）：
 #    只 hook 4 个确定存在的方法，且**绝不自己调用 completion block**。
 #    主接管点是 QXA117 finish:authorized:message:expiresAt: ——
 #    宿主所有卡密路径（成功/网络失败/解析失败）都收敛到这里，
@@ -33,7 +34,7 @@
 # ─────────────────────────────────────────────────────────────
 
 SDK      ?= iphoneos
-# ★★ 默认编 **双切片 arm64 + arm64e**（这是 v2 的重要修正）。
+# ★★ 默认编 **双切片 arm64 + arm64e**（这是 v3 的重要修正）。
 #
 #    原因（实测宿主 Core-SET_1.6）：
 #      宿主 Core 是 thin arm64e (cpusubtype=0x80000002, PAC00)。
@@ -46,7 +47,7 @@ MINIOS   ?= 13.0
 CC        = xcrun -sdk $(SDK) clang
 LIPO      = xcrun -sdk $(SDK) lipo
 
-OUT      = CoreOffline.work.dylib
+OUT      = CoreOffline.v3.dylib
 
 # ★★ 源码清单：**只有一个文件**。测试版也就是一个 TU。
 #    卡密那一套全部在 src/_license/，本 Makefile 不引用。
@@ -63,7 +64,7 @@ INC      = -Iinclude -Isrc
 #                       不需要，加进来只会给自己多一层 dyld 初始化风险
 #      CFNetwork     —— 本 dylib 不做任何网络
 #      CoreGraphics  —— 不需要（图标那套在 src/_license/，不参与构建）
-#      QuartzCore    —— ★ v2 已移除：源码根本没用图层 API
+#      QuartzCore    —— ★ v3 已移除：源码根本没用图层 API
 #
 #    宿主 Core 1.6 自己没有嵌任何 dylib，我们是唯一的注入者，
 #    依赖越少 = dyld 阶段越短 = 越不容易在自签环境下出问题。

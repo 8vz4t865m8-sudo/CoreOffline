@@ -195,11 +195,24 @@ else:
 #  B 组：构建配置
 # ═══════════════════════════════════════════════════════════════════
 
-# B1 install name
-if "@executable_path/CoreOffline.work.dylib" in mk:
-    ok("B1 install name = @executable_path/CoreOffline.work.dylib")
+# B1 install name（★ 必须与 Makefile 的 OUT 一致）
+#    产物名带版本号：CoreOffline.v3.dylib
+if "@executable_path/CoreOffline.v3.dylib" in mk:
+    ok("B1 install name = @executable_path/CoreOffline.v3.dylib")
 else:
     bad("B1 install name 不对 —— insert_dylib 插进去后 dyld 找不到")
+    for ln in mk.splitlines():
+        if ln.strip().startswith("OUT"):
+            print("     实际 OUT 行: %s" % ln.strip())
+
+# B1b 版本号一致性：文件头注释里的产物名要和 OUT 对得上
+_out_m = re.search(r"^\s*OUT\s*=\s*(\S+)", mk, re.M)
+_hdr_m = re.search(r"产物：\s*(\S+\.dylib)", mk)
+if _out_m and _hdr_m:
+    if _out_m.group(1) == _hdr_m.group(1):
+        ok("B1b 头注释产物名与 OUT 一致（%s）" % _out_m.group(1))
+    else:
+        warn("B1b 头注释写 %s，OUT 却是 %s" % (_hdr_m.group(1), _out_m.group(1)))
 
 # B2 只链 Foundation + UIKit（只看生效的 FRAMEWORKS 行，忽略注释）
 fline = ""
