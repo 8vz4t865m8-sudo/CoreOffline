@@ -406,13 +406,28 @@ static CoreImageInBundleImpl CoreHomeOriginalImageInBundle = NULL;
 ///   `method_setImplementation` 那一刻就被别的线程撞上（dyld 阶段确实
 ///   有可能），原实现指针还是 NULL，直接调就是跳空 → 闪退。
 ///   所以这里**先取原实现，装之前必须拿到**；拿不到就整个不装。
+/// 资源名匹配。
+///
+/// 测试版 __cstring 里有三个相关字面量：
+///   0x7c17  hf        ← 前缀判定
+///   0x7c1a  hf.png    ← 确切的兜底文件名
+///   0x7c1d  png       ← 默认扩展名
+///
+/// 所以判定是「名字以 hf 开头」，兜底找的是 "hf.png"。
+static BOOL CoreHomeIsBannerName(NSString *name) {
+    if (name.length == 0) return NO;
+    return [name hasPrefix:@"hf"];
+}
+
 static id CoreHomeImageNamed(id self, SEL _cmd, NSString *name) {
     id img = nil;
     if (CoreHomeOriginalImageNamed) {
         img = CoreHomeOriginalImageNamed(self, _cmd, name);
     }
-    if (!img && name.length && [name hasPrefix:@"hf"]) {
+    if (!img && CoreHomeIsBannerName(name)) {
+        // 先按调用方给的名字找，找不到退到 hf.png
         img = CoreHomeBanner(name, nil);
+        if (!img) img = CoreHomeBanner(@"hf.png", nil);
     }
     return img;
 }
@@ -423,8 +438,9 @@ static id CoreHomeImageInBundle(id self, SEL _cmd, NSString *name,
     if (CoreHomeOriginalImageInBundle) {
         img = CoreHomeOriginalImageInBundle(self, _cmd, name, bundle, traits);
     }
-    if (!img && name.length && [name hasPrefix:@"hf"]) {
+    if (!img && CoreHomeIsBannerName(name)) {
         img = CoreHomeBanner(name, bundle);
+        if (!img) img = CoreHomeBanner(@"hf.png", bundle);
     }
     return img;
 }
@@ -530,13 +546,32 @@ static NSSet<NSString *> *CoreBlockedHosts(void) {
 }
 
 /// 环境资源白名单（反汇编 0x56a8 CoreEnvironmentResource）
+///
+/// 三个字面量全部来自测试版 __cstring，地址都对得上：
+///   0x7b1e  api.appledb.dev
+///   0x7b2e  /ios/                                     ← 独立的段
+///   0x7b34  fastly.jsdelivr.net
+///   0x7b48  /gh/littlebyteorg/appledb@gh-pages/ios/
+///
+/// ★ 注意 "/ios/" 是**单独**一个字符串常量，说明测试版是**分段判**的：
+///   先看 host 是不是 jsdelivr，再看 path 里含不含 "/ios/"。
+///   之前我只判完整前缀，路径稍有不同（比如末尾没斜杠、多了 query）
+///   就会漏掉，导致本该放行的请求被拦。
 static BOOL CoreEnvironmentResource(NSURL *url) {
     if (!url) return NO;
     NSString *host = url.host.lowercaseString;
     NSString *path = url.path ?: @"";
+    if (host.length == 0) return NO;
+
     if ([host isEqualToString:@"api.appledb.dev"]) return YES;
-    if ([host isEqualToString:@"fastly.jsdelivr.net"] &&
-        [path hasPrefix:@"/gh/littlebyteorg/appledb@gh-pages/ios/"]) return YES;
+
+    if ([host isEqualToString:@"fastly.jsdelivr.net"]) {
+        // ① 完整前缀（测试版 0x7b48）
+        if ([path hasPrefix:@"/gh/littlebyteorg/appledb@gh-pages/ios/"]) return YES;
+        // ② 宽松兜底（测试版 0x7b2e 的独立 "/ios/" 段）
+        //    只要路径里出现过 /ios/ 就认，避免因 query / 尾斜杠差异漏判。
+        if ([path containsString:@"/ios/"]) return YES;
+    }
     return NO;
 }
 
@@ -807,10 +842,21 @@ static void initializeOffline(void) {
         record("credential=%llu", (unsigned long long)credential);
 
         // ══ 第 3 段：定位宿主镜像 ══
+        //    ★★ 必须用 ".app/Core" 而不是 ".app/"。
+        //
+        //    证据：测试版 __cstring 0x78ed = ".app/Core"，**不是** ".app/"。
+        //
+        //    为什么这个区别很重要：iOS 上 ".app/" 会命中一大堆路径 ——
+        //      ×xx.app/Frameworks/YYY.framework/YYY   ← 也可能含 .app/
+        //      ×xx.app/PlugIns/ZZZ.appex/ZZZ
+        //      ×xx.app/YYY.dylib
+        //    而主可执行文件固定是 <Name>.app/<Name>，所以 ".app/Core" 这种
+        //    ".app/<可执行名>" 的形状才是精确的。用 ".app/" 很可能先撞上
+        //    framework 的路径，imageBase 就是错的。
         uint32_t count = _dyld_image_count();
         for (uint32_t i = 0; i < count; i++) {
             const char *name = _dyld_get_image_name(i);
-            if (name && strstr(name, ".app/")) {
+            if (name && strstr(name, ".app/Core")) {
                 imageBase = (uint64_t)(uintptr_t)_dyld_get_image_header(i);
                 break;
             }

@@ -46,18 +46,44 @@ def read(p):
 
 def code_only(text):
     """剥掉注释和字符串，只留代码骨架 —— 避免注释里的词误命中。"""
-    # 去块注释
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    # 去行注释
     text = re.sub(r"//[^\n]*", " ", text)
     return text
+
+
+def strip_comments(text):
+    """★ 只去注释，**保留字符串字面量内容**。
+
+    关键点：不能简单地 re.sub(r"//[^\\n]*") —— 那样会把
+    @"https://t.me/cheatrev" 里的 "//" 当成注释起点，URL 就被吃掉了。
+    所以要逐行扫描，跳过字符串内部。
+    """
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    out = []
+    for line in text.split("\n"):
+        in_str = False
+        esc = False
+        cut = None
+        for i, ch in enumerate(line):
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if not in_str and ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
+                cut = i
+                break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
 
 
 def code_and_strings(text):
     """保留字符串字面量内容（用于检查标题表之类），但去掉注释。"""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"//[^\n]*", " ", text)
-    return text
+    return strip_comments(text)
 
 
 RAW = read(SRC)
@@ -509,8 +535,85 @@ def v14():
         warn("V14e 无法确认 CoreInstallMaskHooks 的安装顺序")
 
 
+# ────────────────────────────────────────────────────────────
+# V15  常量字面量必须与测试版 __cstring 逐条对齐
+#
+#     依据：测试版 __cstring (va=0x7788, size=0x4b1) 的完整 dump。
+#     每一条都核对过地址，见 README 第 2 节。
+# ────────────────────────────────────────────────────────────
+def v15():
+    # ① 定位宿主镜像必须用 ".app/Core"（0x78ed），不是 ".app/"
+    if '".app/Core"' in WITHSTR:
+        ok('V15a 用 ".app/Core" 定位宿主镜像  ✔ 对应 __cstring 0x78ed')
+    else:
+        bad('V15a 没用 ".app/Core" —— 用 ".app/" 可能先命中 framework 路径，'
+            'imageBase 会拿错')
+
+    # ② 环境资源：jsdelivr 的 "/ios/" 段（0x7b2e）
+    if '"/ios/"' in WITHSTR or "'/ios/'" in WITHSTR:
+        ok('V15b 含独立 "/ios/" 段  ✔ 对应 __cstring 0x7b2e')
+    else:
+        bad('V15b 缺 "/ios/" —— 测试版 ___cstring 0x7b2e 有这个独立常量')
+
+    # ③ 资源兜底名 hf.png（0x7c1a）
+    if '"hf.png"' in WITHSTR:
+        ok('V15c 含资源兜底名 "hf.png"  ✔ 对应 __cstring 0x7c1a')
+    else:
+        bad('V15c 缺 "hf.png" 兜底名')
+
+    # ④ "hf" 前缀（0x7c17）
+    if '"hf"' in WITHSTR or 'hasPrefix:@"hf"' in WITHSTR:
+        ok('V15d 含资源前缀 "hf"  ✔ 对应 __cstring 0x7c17')
+    else:
+        bad('V15d 缺 "hf" 前缀判定')
+
+    # ⑤ 日志格式串里必须有 %llu 家族（record 的核心）
+    for fmt in ['derive=%llu', 'material=%llu', 'lease=%llu',
+                'credential=%llu', 'bootstrap=%llu']:
+        if fmt not in WITHSTR:
+            bad('V15e 缺日志格式串 "%s"' % fmt)
+            break
+    else:
+        ok('V15e 5 个凭据日志格式串齐全  ✔ 对应 __cstring 0x7788..0x77b2')
+
+    # ⑥ 协议白名单的 5 个字面量（0x7b08..0x7b1a）
+    for p in ['"http"', '"https"', '"ws"', '"wss"', '"ftp"']:
+        if p not in WITHSTR:
+            bad('V15f 缺协议字面量 %s' % p)
+            break
+    else:
+        ok('V15f 协议字面量 http/https/ws/wss/ftp 齐全  ✔ 对应 0x7b08..0x7b1a')
+
+    # ⑦ 主机黑名单 4 条（0x7b70..0x7b93）
+    for h in ['"apple.com"', '".apple.com"', '"cdn-apple.com"', '".cdn-apple.com"']:
+        if h not in WITHSTR:
+            bad('V15g 缺主机黑名单 %s' % h)
+            break
+    else:
+        ok('V15g 主机黑名单 4 条齐全  ✔ 对应 0x7b70..0x7b93')
+
+    # ⑧ #selector(openCommunity:) 必须保留（__objc_selrefs[3]）
+    if "openCommunity:" in WITHSTR:
+        ok('V15h 保留选择子 openCommunity:  ✔ 对应 __objc_selrefs[3]')
+    else:
+        bad('V15h 缺 openCommunity: 选择子 —— 测试版 __objc_selrefs[3] 有它')
+
+    # ⑨ 推广链接（0x789d / CFString[0]）
+    if "https://t.me/cheatrev" in WITHSTR:
+        ok('V15i 推广链接存在  ✔ 对应 __cstring 0x789d')
+    else:
+        bad('V15i 缺推广链接 https://t.me/cheatrev')
+
+    # ⑩ 日志文件路径（0x78f7 / CFString[3]）
+    if "Documents/core-offline-original-id.log" in WITHSTR:
+        ok('V15j 日志路径存在  ✔ 对应 __cstring 0x78f7')
+    else:
+        bad('V15j 缺日志路径')
+
+
 def main():
-    for fn in [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14]:
+    for fn in [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10,
+               v11, v12, v13, v14, v15]:
         try:
             fn()
         except Exception as e:
