@@ -300,6 +300,18 @@ static NSDate *COParseExpiry(NSString *s) {
 
 - (NSString *)cachedExpiry {
     if (_cachedExpiryStore.length == 0) return nil;
+
+    // ★★ 哨兵值绝不能当成有效授权返回。
+    //
+    //   看门狗 / 离线兜底会把 COVerifyPerpetualExpiry() 或
+    //   COVerifyUnauthorizedExpiry() 写进缓存 —— 那两个是**展示给宿主的
+    //   占位值**，不是「真的验过卡密」。如果这里原样放行：
+    //     · 看门狗放行过一次，下次启动 cached.valid → 直接进去；
+    //     · 再下次还是，再再下次还是 —— 卡密验证等于从来没做。
+    //   所以在读出口把这两个哨兵挡住，让每次启动都得重新走一遍流程。
+    if (COVerifyIsUnauthorized(_cachedExpiryStore)) return nil;
+    if ([_cachedExpiryStore isEqualToString:COVerifyPerpetualExpiry()]) return nil;
+
     // 缓存里存的是「到期时间」，但真正在跑的时候还要看服务端有没有提前作废。
     // 这里只做本地时间比对，网络侧的作废由心跳兜底。
     NSDate *end = COParseExpiry(_cachedExpiryStore);
@@ -798,17 +810,29 @@ static NSString *COMessageOfResult(id result) {
     return nil;
 }
 
-/// SDK 不可用时的降级：本地缓存还能用就放行，否则拒绝
+/// SDK 不可用时的降级。
+///
+/// ★★ 这条路径的语义很重要：SDK 没接上**不等于**拒绝用户。
+///
+///   用户的测试版是纯离线、无 SDL、无网络、无卡密，100% 能进。
+///   接了 T3 之后如果「SDK 没装好」就拒绝放行，那等于把用户从
+///   「一定能进」变成「一定进不去」—— 方向反了。
+///
+///   所以：SDK 缺席时**照样放行**，只是给它一个远期到期时间。
+///   真正的卡密校验只有 SDK 可用时才做。
 - (void)verifyFallbackWithCard:(NSString *)card completion:(COVerifyBlock)completion {
-    NSString *expiry = self.cachedExpiry;
-    BOOL sameCard = [_cachedCardStore isEqualToString:card];
-    BOOL ok = (expiry != nil) && sameCard;
+    (void)card;
+    NSString *msg = _setupError.length
+        ? [NSString stringWithFormat:@"验证服务未接入（%@），已离线放行", _setupError]
+        : @"验证服务未接入，已离线放行";
 
-    NSString *msg = ok ? @"已用本地授权放行（离线）"
-                       : @"验证服务未接入，无法激活";
+    CORecord("license.fallback offline-grant (sdk unavailable)");
 
+    // 用「永久」而不是 cachedExpiry：cachedExpiry 现在会挡住哨兵值，
+    // 这里放行是刻意的行为，不能在读出口被吞掉。
+    NSString *expiry = COVerifyPerpetualExpiry();
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (completion) completion(ok, ok ? expiry : nil, @"offline", msg);
+        if (completion) completion(YES, expiry, @"offline", msg);
     });
 }
 
