@@ -57,27 +57,42 @@ jobs:
           fi
           echo "✅ 只有一个编译单元"
 
-          echo "── 断言：禁止出现「自己调用 completion block」的写法"
-          # 上一版就是因为猜 block 签名而闪退（实测是 4 参数）
-          if grep -nE '\(\s*void\s*\(\s*\^\s*\)[^)]*\)\s*(completion|block)' src/CoreOffline.m; then
-            echo "❌ 检测到把 completion 强转成 block 再调用的写法"
-            exit 1
-          fi
-          echo "✅ 未自己调用任何 completion block"
+          # ★ 注意：先剥掉注释再断言。
+          #   src/CoreOffline.m 的头部注释里**故意**提到了这些反模式
+          #   （「上一版就是因为 objc_copyClassList 而崩」），
+          #   直接 grep 会误报。
+          python3 - <<'PY'
+          import re, sys
+          src = open("src/CoreOffline.m", encoding="utf-8").read()
+          code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+          code = re.sub(r"//[^\n]*", "", code)
 
-          echo "── 断言：禁止全局类遍历"
-          if grep -nE 'objc_copyClassList|objc_getClassList' src/CoreOffline.m; then
-            echo "❌ 使用了全局类遍历（dyld 阶段可能崩）"
-            exit 1
-          fi
-          echo "✅ 零全局类遍历"
+          bad = []
 
-          echo "── 断言：禁止 Keychain / Security / 网络拦截"
-          if grep -nE 'SecItem(Add|CopyMatching|Delete)|NSURLSession|NSURLProtocol' src/CoreOffline.m; then
-            echo "❌ 引进了 Keychain / Security / 网络拦截 API"
-            exit 1
-          fi
-          echo "✅ 零 Keychain / Security / 网络拦截"
+          # 把 completion 强转成 block 再调用 —— 上一版闪退的直接原因
+          if re.search(r"\(\s*void\s*\(\s*\^\s*\)[^)]*\)\s*(completion|block)", code):
+              bad.append("把 completion 强转成 block 再调用")
+          if re.search(r"\bblk\s*\(", code):
+              bad.append("直接调用 blk(...)")
+
+          # 全局类遍历
+          if re.search(r"objc_(copy|get)ClassList", code):
+              bad.append("全局类遍历 objc_copyClassList")
+
+          # Keychain / Security / 网络拦截
+          if re.search(r"SecItem(Add|CopyMatching|Delete)", code):
+              bad.append("Keychain API SecItem*")
+          if re.search(r"NSURLSession|NSURLProtocol", code):
+              bad.append("网络拦截 NSURLSession/NSURLProtocol")
+
+          if bad:
+              print("❌ 检测到以下反模式：")
+              for b in bad:
+                  print("   - " + b)
+              sys.exit(1)
+
+          print("✅ 未自己调 block / 零全局类遍历 / 零 Keychain / 零网络拦截")
+          PY
 
       - name: Build dylib
         run: make ARCHS="arm64 arm64e"
