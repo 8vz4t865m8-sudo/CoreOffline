@@ -1,354 +1,289 @@
-# CoreOffline
+# CoreOffline —— 测试版 1:1 复刻
 
-宿主 App 的**授权验证 dylib**。编译出一个 `CoreOffline.work.dylib`，注入后接管四件事：
-
-| 能力 | 做法 |
-|---|---|
-| **卡密验证** | 未授权时弹出深色验证页，走 T3 网络验证，通过后才放行 |
-| **有效期下发** | 宿主问 `authorizationValue` 时，返回该卡密在服务端的真实到期时间 |
-| **网络白名单** | 拦掉宿主对 `apple.com` 系的校验请求，放行 `appledb` 环境资源 |
-| **更新遮罩拦截** | 吞掉 `setDisableUpdateMask:`，宿主弹不出更新遮罩 |
+> **这个仓库现在的唯一目标：让 dylib 注入后 App 能正常进去。**
+>
+> 不是"更好"，是**和用户手上那个能进的测试版行为一致**。
 
 ---
 
-## 构建
+## 现状一句话
 
-需要 macOS + Xcode。仓库自带 CI，推上去就会编译出产物。
+之前的版本一直闪退。原因不是 bug 没修干净，而是**方向错了** ——
+我在一个"带卡密验证"的架构上打补丁，而用户的测试版**根本没有卡密**。
+
+所以这一版把卡密整套拿掉，按测试版二进制的反汇编结果**逐条重写**。
+
+---
+
+## 1. 为什么测试版一定能进
+
+对测试版 `CoreOffline.work.dylib` 完整反汇编后，找到了结构性原因：
+
+| 维度 | 测试版 | 之前的版本 | 后果 |
+|---|---|---|---|
+| 构造函数 | **全同步**，一条直路 | 有 `dispatch_async` + 等窗口 | 时序不确定 |
+| 卡密 | **完全没有** | 5 个函数 + 桥接层 + 弹窗 | 多 3 个失败点 |
+| `authorizationValue` | 直接返回 `2099-12-31 23:59:59` | 走卡密查缓存 | 缓存空 → 拦截 |
+| 弹窗 | 无 | 有（曾有无上限重试） | 死循环 |
+| 看门狗 | 无 | 12s | 超时误触发 |
+| 依赖库 | **3 个 framework** | 7 个 | dyld 阶段多 4 层初始化 |
+| `__bss` | 0x5d8 | 大得多 | — |
+
+**结论：测试版能进，是因为它压根没做验证这件事。** 它只做两件事 ——
+装几个 UI Hook、拦几个网络请求。验证是宿主自己的事，而宿主问
+"授权到什么时候"，它永远答 `2099`。
+
+---
+
+## 2. 复刻了什么
+
+全部结论来自对测试版的逐条反汇编。每条都有证据。
+
+### 2.1 网络拦截（`CoreBlockNetworkURL` @ `0x5600`）
+
+三层判定，**顺序很重要**：
+
+```
+① 协议白名单：scheme ∉ {http, https, ws, wss, ftp}
+       ↓ 不在白名单
+② 环境资源白名单：命中 → 放行
+       ↓ 不是
+   拦
+
+① scheme 在白名单
+       ↓
+② 环境资源白名单：命中 → 放行
+       ↓
+③ 主机黑名单：命中 → 拦
+```
+
+★ 铁证在 `0x5668` 的 **`eor w20, w0, #1`**（取反）——
+意思是「**不在白名单 且 不是环境资源**」才拦。
+
+之前我只有第③层，所以任何自定义 scheme 都会被测试版拦掉、而我放行了。
+
+### 2.2 命中黑名单时不 cancel（`0x5674`）
+
+```
+0x565c  cbz w20, #0x566c      ← 命中黑名单
+...
+0x5674  ldp ... ; retab       ← 直接返回
+```
+
+**中间没有任何 `cancel` 调用。**
+
+所以我写了一个"更正确"的 cancel —— 这正是闪退源之一（宿主的 WS 被掐断，
+宿主逻辑进入异常状态）。现在照抄测试版：**直接 return**。
+
+同理 `cancelNetworkTasks`（`0x5290`）是**纯空壳**，函数体只有一条 `record`。
+
+### 2.3 UI Hook 的 5 个方法
+
+| # | 目标类 | 方法 | 安装点 |
+|---|---|---|---|
+| 1 | `OKDHomeMusicController` | `attachToRootView:` | `0x58c4` |
+| 2 | `OKDHomeMusicController` | `refreshHomeLayoutArtwork` | `0x5944` |
+| 3 | `OKDHomeMusicController` | `authorizationValue` | `0x59c0` |
+| 4 | `UIImage`（元类） | `imageNamed:` | `0x5a38` |
+| 5 | `UIImage`（元类） | `imageNamed:inBundle:compatibleWithTraitCollection:` | `0x5ab0` |
+
+每个都用 `class_addMethod` 优先、失败才 `method_setImplementation`
+（测试版就是这个语义）。
+
+★ 我之前写的 `Community / 社区 / 交流群 / 官方频道` ——
+**这 4 个词在测试版二进制里一个都不存在**，纯粹是我凭空编的。
+
+### 2.4 按钮标题（★ 只有这 5 个）
+
+来自 `__ustring`（`0x7fca`）的 UTF-16 字节：
+
+```
+e567 0b77  6c51 4a54  d063 a44e  e55d 5553  db8f a65e
+```
+
+解码后：
+
+| # | 内容 |
+|---|---|
+| 1 | **查看公告** |
+| 2 | **提交工单** |
+| 3 | **工单进度** |
+| 4 | **激活续时** |
+| 5 | **检查更新** |
+
+按钮处理有**硬上限 15**（`0x54e8` 的 `cmp w24, #0xf; b.hi`），
+命中后只打一条日志、**不跳转**。
+
+### 2.5 更新遮罩（`CoreInstallMaskHooks` @ `0x4d40`）
+
+```
+objc_copyClassList       ← 拿全部类（0x4d54）
+  ↓
+跳过 UIImage 类自己       ← 0x4dac
+  ↓
+class_getSuperclass 向上遍历类族  ← 0x4dbc（一路走到 NSObject）
+  ↓
+class_copyMethodList 找 setDisableUpdateMask:
+  ↓
+objc_setAssociatedObject 存原实现
+  ↓
+装一个**透传** objc_msgSend（0x4e38 的 pacda）
+```
+
+★ 关键是**透传**，不是吞掉。我之前写成屏蔽（不调原实现），行为不同。
+
+### 2.6 构造函数（`0x4b3c`）—— 全同步
+
+```
+bundleIdentifier 检查（不是 qingxiugai.* 就 return）
+  → 开日志 Documents/core-offline-original-id.log
+  → record("constructor pid=%d base=%llx")
+  → arc4random_buf + mach_continuous_time 算 credential
+  → 遍历 dyld images，strstr(name, ".app/") 定位宿主
+  → CoreHomeUIInstall()
+  → monitorBackend()
+  → CoreOfflinePrepare()
+  → CoreOfflineBootstrap()
+```
+
+**没有一处 `dispatch_async`。没有卡密。没有延迟。**
+
+### 2.7 后台定时器（`0x4f6c`）
+
+```objc
+dispatch_source_set_timer(src, now + 2.0s, 1.0s, 0.1s);
+// handler: ticks++ → record → ticks>=8 触发 cancelNetworkTasks()（空壳）
+```
+
+---
+
+## 3. 有没有后门？—— 没有
+
+用户问「他肯定有什么东西连接上了」。查了 98 个导入符号：
+
+**没有** `NSURLSession`、**没有** `CFNetwork*`、**没有** `NSURLConnection`、
+**没有** socket / connect、**没有任何加密符号**。
+
+唯一的外部 URL 是 `https://t.me/cheatrev`（Telegram 推广链接，给按钮用）。
+
+> **测试版只做"拦截"，不做"外发"。它没有任何自己的网络请求。**
+
+用户之前看到的 `ws://47.108.53.191/ws` 是**宿主 App 自己**发起的。
+
+---
+
+## 4. 这一版刻意不做的事
+
+| 不做 | 原因 |
+|---|---|
+| 卡密验证（T3 / 桥接 / 弹窗 / Keychain） | 测试版没有。已挪到 `src/_license/` 留档 |
+| `dispatch_async` 启动流程 | 测试版全同步 |
+| 看门狗 | 测试版没有，且超时误触发 |
+| 真正的 `cancel` | 测试版是直接 return |
+| 任何网络请求 | 测试版只拦不发 |
+| 链 Security / CFNetwork / CoreGraphics | 测试版只链 3 个 framework |
+
+---
+
+## 5. 复刻时补的闪退防护
+
+测试版靠 `__objc_stubs` 走 `objc_msgSend` 转发，天然对 nil 容错。
+我们用直接的函数指针，所以这些必须显式做：
+
+| 防护 | 真机上不做的后果 |
+|---|---|
+| `NSURLSessionTask` 取类时判空 | 它是懒加载类，dyld 阶段返回 nil → `method_setImplementation(nil)` 崩 |
+| 原实现非空才替换 | 跳空指针 |
+| `resume` hook 原实现为空时走 `objc_msgSend` | task 永久停住 |
+| `CoreHomeBanner` 用 `_Thread_local` 递归守卫 | hook 自触发 → 无限递归 → 栈溢出 |
+| `CoreHomeBanner` 用 `@synchronized` 而非 `dispatch_once` | `dispatch_once` 递归调用会**死锁** |
+| `CoreHomeBanner` 用 `_NSGetExecutablePath` 而非 `mainBundle` | `mainBundle` 在 dyld 阶段不可靠 |
+| `CoreInstallMaskHooks` 放最后 | 类还没注册完，遍历到半初始化的元类 |
+
+---
+
+## 6. 构建
+
+需要 macOS + Xcode（`xcrun -sdk iphoneos clang`）。
 
 ```bash
-make                       # 默认 arm64
-make ARCHS="arm64 arm64e"  # 需要 PAC 时
+make                        # arm64e（与测试版一致）
+make ARCHS="arm64"          # 仅 arm64
+make ARCHS="arm64 arm64e"   # 双切片
+make check                  # ★ 行为一致性检查，任何平台都能跑
 make clean
 ```
 
 产物：`CoreOffline.work.dylib`
 
-CI 跑完后在 Actions 页面的 artifacts 里下载。
+**注入要点**：`install name` 必须是
+`@executable_path/CoreOffline.work.dylib`。
 
 ---
 
-## 目录
+## 7. 一致性检查（`make check`）
+
+`checks/clone_parity.py` —— **37 项**，纯 Python，不需要 macOS。
+
+每一项都对应一段反汇编证据：
 
 ```
-CoreOffline/
-├── src/
-│   ├── CoreOffline.m        dylib 入口：构造函数、Hook 安装、授权调度
-│   ├── COTheme.h            深色主题常量（颜色 / 尺寸 / 字体）
-│   ├── COIcon.h/.m          手绘矢量图标（盾/钥匙/公告/标签/勾/叉/警告/转圈）
-│   ├── COLicenseDialog.m    卡密验证弹窗（纯 frame 布局）
-│   └── COVerifyBridge.m     验证桥接层：SDK 装配、验卡、心跳、落盘
-├── include/
-│   ├── COLicenseDialog.h    弹窗对外接口
-│   ├── COVerifyBridge.h     桥接层对外接口
-│   └── COVerifyConfig.h  ★ 你只需要改这个文件
-├── sdk/
-│   └── T3Verify.h/.m        T3 网络验证 SDK
-├── .github/workflows/build.yml
-└── Makefile
+V1   协议白名单 = {http,https,ws,wss,ftp}          ← CFString[5..9] + 0x5668
+V2   按钮标题 = 那 5 个中文词                      ← __ustring UTF-16
+V2b  没有幽灵标题（Community/社区/...）            ← 那些词在测试版里不存在
+V3   按钮上限 = 15                                 ← 0x54e8 cmp w24,#0xf
+V4   命中黑名单直接 return，不调 cancel            ← 0x5674 retab
+V5   cancelNetworkTasks 是空壳                     ← 0x5290
+V6   遮罩：copyClassList + 跳过 UIImage + 类族遍历 + 透传  ← 0x4d54/4dac/4dbc/4e38
+V7   完全不含卡密符号
+V8   构造函数全同步 + 包名守卫 + 四段顺序          ← 0x4b3c/4b7c
+V9   依赖只有 Foundation/UIKit/QuartzCore + arm64e ← LC_LOAD_DYLIB
+V10  5 个导出 API                                  ← 符号表
+V11  定时器 2.0s/1.0s/0.1s + ticks>=8              ← 0x4f6c
+V12  硬编码 2099 授权                              ← CFString[1] / 0x59c0
+V13  不链 libc++
+V14  7 项闪退防护
 ```
+
+CI（`.github/workflows/build.yml`）在 `make check` 之外还断言：
+架构 `cpusubtype=0x80000002`、`install name`、依赖库严格等于 3 个、
+导出符号齐全、**没有任何卡密符号**、`strings` 里有关键串且**没有幽灵标题**。
 
 ---
 
-## 你只需要改一个文件
-
-`include/COVerifyConfig.h` 里集中了所有跟你的后端相关的值：
-
-```objc
-static inline NSString *COVerifyLoginCode(void)  { return @"你的登录code"; }
-static inline NSString *COVerifyNoticeCode(void) { return @"你的公告code"; }
-static inline NSString *COVerifyVersionCode(void){ return @"你的版本code"; }
-static inline NSString *COVerifyHeartbeatCode(void){ return @"你的心跳code"; }
-static inline NSString *COVerifyAppKey(void)     { return @"你的appkey"; }
-static inline NSString *COVerifyRSAPublicKey(void) { return @"-----BEGIN PUBLIC KEY-----\n..."; }
-
-static inline NSString *COVerifyLocalVersion(void) { return @"1000"; }
-static inline NSTimeInterval COVerifyHeartbeatInterval(void) { return 60.0; }
-static inline NSInteger COVerifyMaxHeartbeatFail(void) { return 5; }
-
-static inline NSString *COCommunityURL(void) { return @"https://t.me/你的频道"; }
-```
-
-> **注意**：RSA 公钥要连 `-----BEGIN PUBLIC KEY-----` 头尾一起整段粘进来，
-> 包括换行符 `\n`。少了头尾 SDK 解不出来，验证会一直失败。
-
----
-
-## 卡密验证页
-
-深色商业风、居中弹窗、**纯 frame 布局**（不用 Auto Layout，注入宿主后不受宿主约束体系影响）。
+## 8. 目录结构
 
 ```
-        ┌──────────────────────────┐
-        │         ╭────╮           │   ← 盾牌图标（圆形底衬）
-        │         │ 🛡 │           │
-        │         ╰────╯           │
-        │       卡密验证            │   ← 标题
-        │   请输入卡密以激活完整功能  │   ← 副标题
-        │  ┌────────────────────┐  │
-        │  │ ⓘ 公告内容……       │  │   ← 公告块（拉不到就自动隐藏）
-        │  └────────────────────┘  │
-        │  🏷 服务端版本 1002·本地 1000 │   ← 版本行
-        │ ─────────────────────────│
-        │  ┌────────────────────┐  │
-        │  │ 🔑 XXXX-XXXX-XXXX  │粘贴│  ← 卡密输入
-        │  └────────────────────┘  │
-        │  ┌────────────────────┐  │
-        │  │     验证并激活      │  │   ← 主题蓝按钮
-        │  └────────────────────┘  │
-        │      错误提示 / 状态文字    │   ← 有内容才占位
-        └──────────────────────────┘
-```
+src/
+  CoreOffline.m          ← ★ 唯一的编译单元，测试版 1:1 复刻
+  _license/              ← 卡密那一套，留档不参与构建
+    COEntry.m  COVerifyBridge.m  COKeychain.m
+    COLicenseDialog.m  COIcon.m  COLog.m  COTheme.h
 
-行为要点：
+checks/
+  clone_parity.py        ← 37 项一致性检查
 
-- **点遮罩不关闭** —— 授权页必须走完流程，误触关掉用户不知道怎么再打开
-- **键盘弹起卡片上移**，弹窗本身不滚（内容高度可控）
-- **输入框关掉自动更正、强制大写** —— 卡密区分大小写，也避免被中文输入法改写
-- **粘贴按钮**会顺手清掉空格和换行
-- **成功后先播绿色反馈再收起**（0.55s），让用户看清结果
-- **失败后按钮恢复可用**，可以立刻重试
-
----
-
-## 授权链路
-
-```
-App 启动
-   │
-   ├─ dylib 构造函数
-   │    ├─ 打开日志 Documents/core-offline.log
-   │    ├─ 生成凭据链 material → lease → derive → credential
-   │    ├─ 定位宿主镜像（.app/ 路径）
-   │    ├─ 安装 Hook（控制器 / 图片 / 网络 / 更新遮罩）
-   │    └─ 启动后台状态监视
-   │
-   └─ 延后 0.6s（等窗口就绪）→ 检查授权
-         │
-         ├─ 本地缓存有效 ──────────────→ 放行
-         │
-         └─ 需要验证 → 弹卡密页
-                │
-                ├─ 验证成功 → 落盘 → 启动心跳 → 放行
-                │              （到期时间存 NSUserDefaults）
-                │
-                └─ 验证失败 → 提示错误 → 允许重试
-
-心跳（60s 一次）
-   │
-   ├─ 成功 → 失败计数归零
-   └─ 连续失败 5 次 → 停心跳 + 重置授权态 + 重新弹验证页
-```
-
-宿主侧问有效期时：
-
-```objc
-- (id)authorizationValue {
-    return CoreLicenseExpiryString();
-}
-```
-
-返回值只有两种：
-
-| 情况 | 返回值 |
-|---|---|
-| 已验证 / 缓存有效 | 服务端下发的真实到期时间 `"2027-03-15 12:00:00"` |
-| 未验证 | `"1970-01-01 00:00:01"`（哨兵值，宿主会走自带过期流程） |
-
-> 用哨兵值而不是 `nil`：宿主拿到 `nil` 可能直接崩（比如塞进 `NSDateFormatter`）。
-> 判断是否未授权请用 `COVerifyIsUnauthorized(expiry)`，别去硬比年份。
-
----
-
-## 网络白名单
-
-`NSURLSessionTask -resume` 被 Hook，按这个顺序判定：
-
-1. **环境资源白名单**（放行）
-   - `api.appledb.dev`
-   - `fastly.jsdelivr.net/gh/littlebyteorg/appledb@gh-pages/ios/`
-2. **拦截名单**（吞掉，不发起请求）
-   - `apple.com` / `*.apple.com`
-   - `cdn-apple.com` / `*.cdn-apple.com`
-3. 其余 → 调原始 `resume` 正常放行
-
-> 顺序不能反。白名单里如果有域名同时匹配了拦截规则，必须让白名单先判 ——
-> 否则环境资源会被自己拦掉，宿主的图标全变空白。
-
----
-
-## 更新遮罩拦截
-
-遍历 `objc_copyClassList`，**只处理宿主 App 内**的类（`class_getImageName` 里含 `.app/`），
-把它们的 `setDisableUpdateMask:` 实现换成空函数。
-
-不改系统类，是为了避免影响别的进程/框架。
-
----
-
-## 面板 / 弹窗布局的三条规矩
-
-从实际踩坑总结，改布局前请先读：
-
-### ① 所有 frame 赋值只能出现在 `layoutCardInBounds:`
-
-页面里别处不写 `.frame =`。布局是一次算完的：从上往下堆区块，`y` 累加得到内容高，
-中间不改两次。分成多处赋值，早晚出现「摆了哪些元素」和「总高」对不上。
-
-### ② 隐藏区块必须同时塌陷
-
-只 `hidden = YES` 不改 frame，会在原来的位置留一块空白。所以隐藏时必须
-`frame = CGRectZero`，让后续元素往上收。
-
-### ③ 布局函数首行必须有 0 尺寸守卫
-
-```objc
-if (!_card || size.width <= 0 || size.height <= 0) return;
-```
-
-首帧 `bounds` 可能是 0，除以 0 会算出 `NaN` 位置，卡片直接消失且再也回不来。
-
----
-
-## 日志
-
-运行时日志写在宿主的 `Documents/core-offline.log`，可以这样捞：
-
-```bash
-# 越狱设备
-ssh root@<device> cat /var/mobile/Containers/Data/Application/<uuid>/Documents/core-offline.log
-```
-
-关键行：
-
-```
-constructor pid=1234 base=0x104abc000
-derive=... material=... lease=... credential=...
-license.expiry=2027-03-15 12:00:00          ← 授权成功
-license.expiry=UNAUTHORIZED(no valid license) ← 未授权
-license.dialog.present                       ← 弹了验证页
-license.granted expiry=... state=...          ← 验证通过
-license.denied msg=卡密不存在                  ← 验证失败
-heartbeat.lost → present license dialog       ← 心跳掉线
-network.cancel host=xxx.apple.com             ← 拦掉的请求
-mask.hook class=XXX                           ← 更新遮罩 Hook 装上
+_license_archive/        ← 更早的卡密代码 + 旧检查脚本
+  sdk/T3Verify.m
+  include/COVerifyConfig.h  COVerifyBridge.h  COLicenseDialog.h
+  src/co_*.py.check
 ```
 
 ---
 
-## 常见问题
+## 9. 下一步
 
-**验证一直失败？**
-先看日志里 T3 SDK 有没有装配上（`T3Verify SDK 已装配`）。没有的话是 SDK 没编进 dylib，
-或者 `T3Verify.h` 的类名不对。
+1. **真机验证能不能进**（唯一目标）
+2. 能进之后，再讨论网络拦截要不要加 `cancel`（用户之前说"就是要拦它"）
+3. **然后**才重新把卡密接回来 —— 用户原话：
+   > 「弄好了，我们过后再来重新把卡密弄上去。」
 
-**日志里出现 `T3Verify SDK 未接入`？**
-SDK 类找不到，验证会走本地缓存降级路径 —— 有有效缓存才放行。检查 `sdk/T3Verify.m`
-是否在 Makefile 的 `SRC` 里。
-
-**宿主图标全变空白？**
-网络白名单顺序写反了，环境资源被自己拦掉。
-
-**弹窗弹不出来？**
-dylib 构造函数里挂弹窗时窗口还没建好。现在改成轮询等宿主窗口就绪（最多 10s），
-等不到也会把子系统跑起来，只是弹不出窗。日志里搜 `host.ready` 看等了多久。
-
-**卡密输入被自动改成中文？**
-输入框已设 `autocorrectionType = No` + `autocapitalizationType = AllCharacters`。
-如果还串，检查有没有别的 dylib 也在 Hook `UITextField`。
+骨架已经留好：`src/_license/` + `_license_archive/`，接回来只是改 Makefile 的
+`SRC` 和 `FRAMEWORKS`。
 
 ---
 
-## ★ 注入后闪退？先看这一节
+## 10. 免责
 
-**曾在真机上遇到「一注入就闪退」，根因是构造函数在 dyld 阶段做了重活。**
-
-### 现象
-
-- 注入后 App 直接崩，看不到任何界面
-- 或者偶发：启动几秒后才崩（取决于宿主什么时候读授权值）
-
-### 根因
-
-`constructor` 的执行时机是 **dyld 加载 dylib 的瞬间**，此时宿主 App 的
-`UIApplication` 还没创建、主 runloop 还没跑、一堆系统子系统还没初始化。
-
-卡密模块有四类依赖在这个阶段**不安全**：
-
-| 依赖 | 为什么不安全 |
-|---|---|
-| `NSUserDefaults` | `_CFXPreferences` 子系统可能还没建立，早期访问直接崩 |
-| `Security.framework` | `T3RSACrypto` 解析 RSA 公钥走 `SecKeyCreateWithData`，早期 CSP 未就绪 |
-| `NSDateFormatter` / `NSLocale` | 需要 ICU + locale 数据就绪 |
-| `NSTimer` | 需要 runloop 已经在转 |
-
-原始（能跑）的 CoreOffline 之所以没事，是因为它**整个 constructor 只做
-Mach-O + objc runtime 层面的操作**（hook 方法、遍历类），这些都是 dyld 阶段安全的。
-
-### 修法：构造函数只挂载，不执行
-
-```objc
-__attribute__((constructor))
-static void initializeOffline(void) {
-    // 第 1 段：零依赖准备（dyld 阶段安全）
-    CoreLogOpen();                    // NSHomeDirectory + open(2)
-    /* 凭据链：arc4random_buf / mach_continuous_time，纯系统调用 */
-    /* 定位宿主镜像：_dyld_image_count 等纯 dyld API */
-
-    // 第 2 段：CoreOffline 本体（与原始版行为一致，dyld 阶段安全）
-    CoreHomeUIInstall();
-    monitorBackend();
-    CoreOfflinePrepare();
-    CoreOfflineBootstrap();
-
-    // 第 3 段：卡密子系统 —— 只调度，不执行
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CoreWaitForHostReady(40);     // 轮询等窗口，最多 10s
-    });
-}
-```
-
-`CoreStartLicenseSubsystem()` 里才第一次碰 `[COVerifyBridge shared]`，
-并且**先建单例、再置 `gLicenseSubsystemUp`、最后才 `CoreCheckLicense`**。
-
-### 还有一条容易被忽略的雷
-
-`CoreLicenseExpiryString()` 被 hook 到宿主的 `authorizationValue` getter 上。
-**宿主完全可能在 App 启动早期就读这个值** —— 那时候它去调
-`[COVerifyBridge shared]` 就会碰 `NSUserDefaults`，直接崩。
-
-所以这个函数必须自带守卫：
-
-```objc
-static NSString *CoreLicenseExpiryString(void) {
-    if (!gLicenseSubsystemUp) {
-        // 早期路径：一个字都不能多说，也一个字都不能多读。
-        return COVerifyUnauthorizedExpiry();
-    }
-    /* ...正常读缓存... */
-}
-```
-
-### 怎么防止再犯
-
-`checks/co_audit.py` 的 **H 节**专门查这个：
-
-- **H1** — constructor 函数体里不许出现 `NSUserDefaults` / `T3Verify` /
-  `NSDateFormatter` / `NSTimer` / `[COVerifyBridge shared]`
-- **H2** — 卡密子系统必须经 `dispatch_async(main_queue)` 延后启动
-- **H3** — `CoreLicenseExpiryString` 必须有 `gLicenseSubsystemUp` 守卫
-- **H4** — 守卫标志必须被置位（定义了不置位会导致永远判定未授权），
-  且置位必须在 `shared` 初始化之后
-
-这套检查经过有效性验证：故意去掉守卫再跑，H1/H3 会准确报错。
-
-### 架构也要对齐
-
-原始测试版是 **arm64e (PAC00)**。Makefile 默认已改成 `ARCHS = arm64e`，
-CI 里也加了 `ARM64E` + `PAC00` 断言。编成纯 arm64 虽然通常也能加载，
-但和原始版不一致，在带 PAC 检查的越狱环境里可能出问题。
-
----
-
-## 许可
-
-仅供学习研究。
+仅用于**自己拥有**的设备和应用的研究 / 学习用途。
+使用者需自行承担一切后果。
