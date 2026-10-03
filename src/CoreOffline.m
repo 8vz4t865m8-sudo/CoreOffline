@@ -115,13 +115,28 @@ uint64_t CoreRemoteFault(uint64_t mode, const char *reason) {
 
 #pragma mark - 授权有效期 (★ 已接上卡密校验结果)
 
+/// 卡密子系统是否已经启动完毕。
+/// 在这个标志翻成 YES 之前，任何路径都不许碰 COVerifyBridge ——
+/// 它的 init 会读 NSUserDefaults，在 dyld 阶段是未定义行为。
+static volatile BOOL gLicenseSubsystemUp = NO;
+
 /// 宿主问「这机器授权到什么时候」，答案来自卡密验证：
 ///   · 已通过验证  → COVerifyBridge.cachedExpiry（服务端下发的真实到期时间）
 ///   · 未通过验证  → COVerifyUnauthorizedExpiry()，一个早得离谱的时间戳
 ///
 /// ★ 不用 nil：宿主拿到 nil 可能直接崩（比如塞进 NSDateFormatter）。
 ///   给个明确「早就过期」的值，宿主会走它自带的过期流程。
+///
+/// ★★ 这个函数会被 hook 到宿主的 authorizationValue getter 上。
+///    宿主完全可能在 App 启动早期就读它（早于我们的卡密子系统起来），
+///    那时候调 [COVerifyBridge shared] 会去碰 NSUserDefaults —— 直接崩。
+///    所以：子系统没起来之前，一律回答「未授权」，不做任何 IO。
 static NSString *CoreLicenseExpiryString(void) {
+    if (!gLicenseSubsystemUp) {
+        // 早期路径：一个字都不能多说，也一个字都不能多读。
+        return COVerifyUnauthorizedExpiry();
+    }
+
     COVerifyBridge *bridge = [COVerifyBridge shared];
     NSString *expiry = bridge.cachedExpiry;
     if (expiry.length) {
@@ -166,6 +181,13 @@ static UIViewController *CoreTopViewController(void) {
 /// 需要验证时弹出来。已经弹着就不重复弹。
 static void CorePresentLicenseDialog(void) {
     if (gDialog) return;
+
+    // 双保险：这个函数只该在卡密子系统起来之后被调。
+    // 万一哪天有人从别处调进来，这里挡住比崩掉强。
+    if (!gLicenseSubsystemUp) {
+        record("license.dialog BLOCKED (subsystem not up yet)");
+        return;
+    }
 
     UIViewController *host = CoreTopViewController();
     if (!host) {
@@ -530,16 +552,87 @@ static void monitorBackend(void) {
     dispatch_resume(stageTimer);
 }
 
-#pragma mark - 构造函数 (initializeOffline)
+#pragma mark - 构造函数
+
+//
+// ★★ 这里是整条链上最容易崩的地方，规矩只有一条：
+//    constructor 里绝不做任何依赖「App 已启动」的事。
+//
+//    所有现有的 CoreOffline 逻辑（UI hook / 网络 hook / 凭据链）都是
+//    纯 Mach-O + objc runtime 层面的操作，在 dyld 阶段就是安全的 ——
+//    原始版证明了这一点。
+//
+//    但卡密模块不一样，它有四个「早期不安全」的依赖：
+//      1. NSUserDefaults   —— _CFXPreferences 子系统可能还没建，
+//                             早期访问会直接崩（iOS 开发经典陷阱）
+//      2. Security.framework —— T3RSACrypto 解析 RSA 公钥走 SecKeyCreateWithData，
+//                               早期调用会拿到未初始化的 CSP
+//      3. NSDateFormatter / NSLocale —— 需要 ICU + locale 数据就绪
+//      4. NSTimer          —— 需要 runloop 已经在跑
+//
+//    所以：constructor 只做「零依赖」的准备工作，
+//         卡密侧一律延后到 App 启动完成之后（见 CoreStartLicenseSubsystem）。
+//
+
+/// 卡密子系统的启动：必须等主 runloop 跑起来之后再调。
+/// 单独抽出来是为了让 constructor 保持「一眼能看完」的长度。
+static void CoreStartLicenseSubsystem(void) {
+    // 到了这里 NSUserDefaults / Security / locale 都齐了，
+    // shared 单例可以安全地建。
+    COVerifyBridge *bridge = [COVerifyBridge shared];
+
+    // 心跳掉线 → 收回授权并拉回验证页
+    bridge.onHeartbeatLost = ^{
+        record("heartbeat.lost → present license dialog");
+        gAuthorized = NO;
+        CorePresentLicenseDialog();
+    };
+
+    // ★ 置位必须在 shared 建好之后、CoreCheckLicense 之前 ——
+    //   CoreCheckLicense 会走 CoreLicenseExpiryString，
+    //   而那个函数靠这个标志决定「能不能读缓存」。
+    gLicenseSubsystemUp = YES;
+
+    record("license.subsystem.start sdk=%d", (int)bridge.available);
+    CoreCheckLicense();
+}
+
+/// 等宿主 App 启动到「有窗口」为止，然后交给 CoreStartLicenseSubsystem。
+/// 用轮询而不是写死延时：宿主启动快慢差很多，写死 0.6s 在慢机器上会
+/// 挂在 nil 窗口上，在快机器上又是白等。
+static void CoreWaitForHostReady(NSInteger attemptsLeft) {
+    UIViewController *host = CoreTopViewController();
+    if (host) {
+        record("host.ready after %ld retries", (long)(40 - attemptsLeft));
+        CoreStartLicenseSubsystem();
+        return;
+    }
+    if (attemptsLeft <= 0) {
+        // 兜底：实在等不到窗口（比如宿主根本没有 UI），
+        // 也把子系统跑起来，让缓存/心跳生效，只是弹不出窗。
+        record("host.ready TIMEOUT, start subsystem anyway");
+        CoreStartLicenseSubsystem();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CoreWaitForHostReady(attemptsLeft - 1);
+    });
+}
 
 __attribute__((constructor))
 static void initializeOffline(void) {
     @autoreleasepool {
+        // ── 第 1 段：零依赖准备（dyld 阶段安全）──
+        //
+        // CoreLogOpen 走 NSHomeDirectory + open(2)，原始版就是这么干的，
+        // 实测在 constructor 阶段可用。
         CoreLogOpen();
         record("constructor pid=%d base=%llx", getpid(),
                (unsigned long long)(uintptr_t)_dyld_get_image_header(0));
 
         // 凭据链 (对应 derive/material/lease/credential 日志)
+        // arc4random_buf / mach_continuous_time 都是纯系统调用，无依赖。
         uint64_t material = 0, derive = 0;
         arc4random_buf(&material, sizeof(material));
         uint64_t lease = material ^ (uint64_t)mach_continuous_time();
@@ -560,26 +653,20 @@ static void initializeOffline(void) {
             }
         }
 
+        // ── 第 2 段：CoreOffline 本体（与原始版行为一致）──
         CoreHomeUIInstall();
         monitorBackend();
-
-        // 心跳掉线 → 拉回验证页
-        [COVerifyBridge shared].onHeartbeatLost = ^{
-            record("heartbeat.lost → present license dialog");
-            gAuthorized = NO;
-            CorePresentLicenseDialog();
-        };
-
         CoreOfflinePrepare();
         CoreOfflineBootstrap();
 
-        // ★ 授权检查放在主线程且稍延一拍：
-        //   constructor 阶段窗口还没建好，立刻挂弹窗会挂到 nil 上。
+        // ── 第 3 段：卡密子系统 —— 只调度，不执行 ──
+        //
+        // ★ 这里绝不能直接调 [COVerifyBridge shared]：
+        //   那会在 dyld 阶段拉起 NSUserDefaults + Security，必崩。
+        //   用 dispatch_async 把整个启动过程推到主队列，
+        //   此时 App 的 runloop 已经在转，所有子系统都就绪。
         dispatch_async(dispatch_get_main_queue(), ^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                CoreCheckLicense();
-            });
+            CoreWaitForHostReady(40);   // 最多等 10s
         });
     }
 }

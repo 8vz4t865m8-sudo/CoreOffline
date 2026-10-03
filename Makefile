@@ -2,8 +2,9 @@
 #  CoreOffline —— 授权验证 dylib
 #
 #  构建（需 macOS + Xcode）：
-#     make                # 默认 arm64
-#     make ARCHS="arm64 arm64e"
+#     make                # 默认 arm64e（与原始测试版一致）
+#     make ARCHS="arm64"  # 仅 arm64
+#     make ARCHS="arm64 arm64e"   # 双切片 fat
 #     make clean
 #
 #  产物：CoreOffline.work.dylib
@@ -12,7 +13,10 @@
 # ─────────────────────────────────────────────────────────────
 
 SDK      ?= iphoneos
-ARCHS    ?= arm64            # 原文件是 arm64e(PAC); 如确有需要可改成 "arm64 arm64e"
+# ★ 默认编 arm64e：原始测试版就是 arm64e(PAC00)，
+#   注入目标（越狱设备上的 arm64e 宿主）对它最友好。
+#   想编 arm64 就显式传 ARCHS="arm64"。
+ARCHS    ?= arm64e
 MINIOS   ?= 13.0
 CC        = xcrun -sdk $(SDK) clang
 

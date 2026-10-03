@@ -249,12 +249,103 @@ SDK 类找不到，验证会走本地缓存降级路径 —— 有有效缓存�
 网络白名单顺序写反了，环境资源被自己拦掉。
 
 **弹窗弹不出来？**
-dylib 构造函数里挂弹窗时窗口还没建好。代码里已经延后 0.6s，
-如果宿主启动特别慢可以把这个延时加大。
+dylib 构造函数里挂弹窗时窗口还没建好。现在改成轮询等宿主窗口就绪（最多 10s），
+等不到也会把子系统跑起来，只是弹不出窗。日志里搜 `host.ready` 看等了多久。
 
 **卡密输入被自动改成中文？**
 输入框已设 `autocorrectionType = No` + `autocapitalizationType = AllCharacters`。
 如果还串，检查有没有别的 dylib 也在 Hook `UITextField`。
+
+---
+
+## ★ 注入后闪退？先看这一节
+
+**曾在真机上遇到「一注入就闪退」，根因是构造函数在 dyld 阶段做了重活。**
+
+### 现象
+
+- 注入后 App 直接崩，看不到任何界面
+- 或者偶发：启动几秒后才崩（取决于宿主什么时候读授权值）
+
+### 根因
+
+`constructor` 的执行时机是 **dyld 加载 dylib 的瞬间**，此时宿主 App 的
+`UIApplication` 还没创建、主 runloop 还没跑、一堆系统子系统还没初始化。
+
+卡密模块有四类依赖在这个阶段**不安全**：
+
+| 依赖 | 为什么不安全 |
+|---|---|
+| `NSUserDefaults` | `_CFXPreferences` 子系统可能还没建立，早期访问直接崩 |
+| `Security.framework` | `T3RSACrypto` 解析 RSA 公钥走 `SecKeyCreateWithData`，早期 CSP 未就绪 |
+| `NSDateFormatter` / `NSLocale` | 需要 ICU + locale 数据就绪 |
+| `NSTimer` | 需要 runloop 已经在转 |
+
+原始（能跑）的 CoreOffline 之所以没事，是因为它**整个 constructor 只做
+Mach-O + objc runtime 层面的操作**（hook 方法、遍历类），这些都是 dyld 阶段安全的。
+
+### 修法：构造函数只挂载，不执行
+
+```objc
+__attribute__((constructor))
+static void initializeOffline(void) {
+    // 第 1 段：零依赖准备（dyld 阶段安全）
+    CoreLogOpen();                    // NSHomeDirectory + open(2)
+    /* 凭据链：arc4random_buf / mach_continuous_time，纯系统调用 */
+    /* 定位宿主镜像：_dyld_image_count 等纯 dyld API */
+
+    // 第 2 段：CoreOffline 本体（与原始版行为一致，dyld 阶段安全）
+    CoreHomeUIInstall();
+    monitorBackend();
+    CoreOfflinePrepare();
+    CoreOfflineBootstrap();
+
+    // 第 3 段：卡密子系统 —— 只调度，不执行
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CoreWaitForHostReady(40);     // 轮询等窗口，最多 10s
+    });
+}
+```
+
+`CoreStartLicenseSubsystem()` 里才第一次碰 `[COVerifyBridge shared]`，
+并且**先建单例、再置 `gLicenseSubsystemUp`、最后才 `CoreCheckLicense`**。
+
+### 还有一条容易被忽略的雷
+
+`CoreLicenseExpiryString()` 被 hook 到宿主的 `authorizationValue` getter 上。
+**宿主完全可能在 App 启动早期就读这个值** —— 那时候它去调
+`[COVerifyBridge shared]` 就会碰 `NSUserDefaults`，直接崩。
+
+所以这个函数必须自带守卫：
+
+```objc
+static NSString *CoreLicenseExpiryString(void) {
+    if (!gLicenseSubsystemUp) {
+        // 早期路径：一个字都不能多说，也一个字都不能多读。
+        return COVerifyUnauthorizedExpiry();
+    }
+    /* ...正常读缓存... */
+}
+```
+
+### 怎么防止再犯
+
+`checks/co_audit.py` 的 **H 节**专门查这个：
+
+- **H1** — constructor 函数体里不许出现 `NSUserDefaults` / `T3Verify` /
+  `NSDateFormatter` / `NSTimer` / `[COVerifyBridge shared]`
+- **H2** — 卡密子系统必须经 `dispatch_async(main_queue)` 延后启动
+- **H3** — `CoreLicenseExpiryString` 必须有 `gLicenseSubsystemUp` 守卫
+- **H4** — 守卫标志必须被置位（定义了不置位会导致永远判定未授权），
+  且置位必须在 `shared` 初始化之后
+
+这套检查经过有效性验证：故意去掉守卫再跑，H1/H3 会准确报错。
+
+### 架构也要对齐
+
+原始测试版是 **arm64e (PAC00)**。Makefile 默认已改成 `ARCHS = arm64e`，
+CI 里也加了 `ARM64E` + `PAC00` 断言。编成纯 arm64 虽然通常也能加载，
+但和原始版不一致，在带 PAC 检查的越狱环境里可能出问题。
 
 ---
 

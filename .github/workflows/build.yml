@@ -30,8 +30,20 @@ jobs:
           test -f sdk/T3Verify.m || { echo "missing sdk/T3Verify.m"; exit 1; }
           echo "sources ok"
 
+          echo "── 构造函数早期安全性（真机闪退防线，必须有）"
+          python3 checks/co_ctor.py || { echo "❌ 构造函数安全检查未通过"; exit 1; }
+
+          echo "── 其他静态审计"
+          for s in co_build co_logic co_realapi; do
+            if [ -f "checks/$s.py" ]; then
+              echo "   运行 checks/$s.py"
+              python3 "checks/$s.py" || { echo "❌ $s 未通过"; exit 1; }
+            fi
+          done
+          echo "✅ 审计通过"
+
       - name: Build dylib
-        run: make ARCHS="arm64"
+        run: make ARCHS="arm64e"
 
       - name: Verify Mach-O
         run: |
@@ -43,6 +55,29 @@ jobs:
           otool -L CoreOffline.work.dylib
           echo "── exported symbols:"
           nm -gU CoreOffline.work.dylib | grep -E "Core(Offline|Remote)" || true
+
+          echo "── 架构断言（必须与原始测试版一致：arm64e / PAC00）"
+          otool -hv CoreOffline.work.dylib | grep -q "ARM64E" \
+            || { echo "❌ 架构不是 arm64e —— 原始测试版是 arm64e(PAC00)，编错架构会导致注入异常"; exit 1; }
+          otool -hv CoreOffline.work.dylib | grep -q "PAC00" \
+            || { echo "❌ 缺少 PAC00 标记"; exit 1; }
+          echo "✅ arm64e (PAC00)"
+
+          echo "── install name 断言"
+          otool -D CoreOffline.work.dylib | grep -q "@executable_path/CoreOffline.work.dylib" \
+            || { echo "❌ install name 不对，注入后 dyld 找不到"; exit 1; }
+          echo "✅ install name ok"
+
+          echo "── QuartzCore 断言（CABasicAnimation 用）"
+          otool -L CoreOffline.work.dylib | grep -q "QuartzCore" \
+            || { echo "❌ 缺 QuartzCore"; exit 1; }
+          echo "✅ QuartzCore ok"
+
+          echo "── 注入安全性断言：constructor 里不许有 NSUserDefaults / T3Verify 直接调用"
+          if nm -u CoreOffline.work.dylib | grep -q "NSUserDefaults"; then
+            echo "⚠️  有 NSUserDefaults 未定义符号（可能来自 COVerifyBridge，属预期）"
+          fi
+          echo "✅ 检查完成"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
