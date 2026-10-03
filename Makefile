@@ -28,9 +28,15 @@ SRC      = src/CoreOffline.m \
 # 头文件搜索路径
 INC      = -Iinclude -Isrc -Isdk
 
-# T3 SDK 用到 CommonCrypto(md5) 与 Security(RSA)
+# 链接的框架：
+#   Foundation / UIKit  —— 基础
+#   CoreGraphics        —— COIcon 手绘矢量图标（CGContext 那套）
+#   QuartzCore          —— CABasicAnimation，提交按钮里的转圈动画
+#   Security            —— T3 SDK 的 RSA 公钥解密
+#   CommonCrypto 不需要单独链，跟随 Security 一起进来（CC_MD5）
 FRAMEWORKS = -framework Foundation -framework UIKit \
-             -framework Security -framework CoreGraphics
+             -framework CoreGraphics -framework QuartzCore \
+             -framework Security
 
 CFLAGS   = -dynamiclib -fobjc-arc -O2 -Wall -Wno-unused-variable \
            $(foreach a,$(ARCHS),-arch $(a)) \
