@@ -148,12 +148,28 @@ jobs:
 
           echo
           echo "════════ 幽灵字符串断言（测试版里**不存在**的）════════"
-          if strings -a CoreOffline.work.dylib | grep -qE "Community|社区|交流群|官方频道"; then
+          # ★ 注意：openCommunity: 是 __objc_selrefs[3] 的**真实选择子名**，
+          #   必须保留。它恰好含 "Community"，所以这里要排除掉它再判。
+          GHOST=$(strings -a CoreOffline.work.dylib \
+                  | grep -E "Community|社区|交流群|官方频道" \
+                  | grep -v "^openCommunity:$" || true)
+          if [ -n "$GHOST" ]; then
             echo "❌ 出现了测试版里不存在的标题："
-            strings -a CoreOffline.work.dylib | grep -E "Community|社区|交流群|官方频道"
+            echo "$GHOST"
             exit 1
           fi
-          echo "✅ 没有幽灵标题"
+          echo "✅ 没有幽灵标题（openCommunity: 已排除，它是真实选择子名）"
+
+          echo
+          echo "════════ 按钮标题断言（★ 必须是那 5 个中文词）════════"
+          for t in "查看公告" "提交工单" "工单进度" "激活续时" "检查更新"; do
+            # __ustring 是 UTF-16LE，strings 默认读不出来，用 -e l
+            if ! strings -a -e l CoreOffline.work.dylib | grep -q "$t"; then
+              echo "❌ 缺按钮标题: $t"
+              exit 1
+            fi
+          done
+          echo "✅ 查看公告 / 提交工单 / 工单进度 / 激活续时 / 检查更新"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
