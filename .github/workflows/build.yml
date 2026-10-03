@@ -162,14 +162,40 @@ jobs:
 
           echo
           echo "════════ 按钮标题断言（★ 必须是那 5 个中文词）════════"
-          for t in "查看公告" "提交工单" "工单进度" "激活续时" "检查更新"; do
-            # __ustring 是 UTF-16LE，strings 默认读不出来，用 -e l
-            if ! strings -a -e l CoreOffline.work.dylib | grep -q "$t"; then
-              echo "❌ 缺按钮标题: $t"
-              exit 1
-            fi
-          done
-          echo "✅ 查看公告 / 提交工单 / 工单进度 / 激活续时 / 检查更新"
+          # ★ 两个注意点：
+          #   ① macOS 的 strings **不支持** -e l（那是 GNU binutils 的选项，
+          #      Xcode 自带的会直接报 unknown flag）。所以用 Python 直接搜字节。
+          #   ② 测试版把这 5 个标题放在 __ustring（UTF-16LE），但 clang 编
+          #      @"..." 字面量时可能选 UTF-8。**两种编码都接受**，只要有一份在。
+          python3 - <<'PY'
+          import sys
+          data = open("CoreOffline.work.dylib", "rb").read()
+          titles = ["查看公告", "提交工单", "工单进度", "激活续时", "检查更新"]
+          missing = []
+          for t in titles:
+              has_u16 = t.encode("utf-16-le") in data
+              has_u8 = t.encode("utf-8") in data
+              if not has_u16 and not has_u8:
+                  missing.append(t)
+          if missing:
+              print("❌ 缺按钮标题（UTF-16LE / UTF-8 都没有）: %s" % missing)
+              sys.exit(1)
+          print("✅ 查看公告 / 提交工单 / 工单进度 / 激活续时 / 检查更新")
+          PY
+
+          echo
+          echo "════════ 幽灵标题断言（双编码保险）════════"
+          python3 - <<'PY'
+          import sys
+          data = open("CoreOffline.work.dylib", "rb").read()
+          ghosts = ["社区", "交流群", "官方频道", "联系客服"]
+          hit = [g for g in ghosts
+                 if g.encode("utf-16-le") in data or g.encode("utf-8") in data]
+          if hit:
+              print("❌ 出现了测试版里不存在的标题: %s" % hit)
+              sys.exit(1)
+          print("✅ 没有幽灵标题")
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
