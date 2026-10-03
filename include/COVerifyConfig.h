@@ -104,9 +104,26 @@ static inline NSString *COVerifyDeviceID(void) {
     return cached;
 }
 
-#pragma mark - 社群链接
+#pragma mark - 目标宿主
+
+/// ★★ 目标宿主的 Bundle ID —— 注入后只对这个 App 生效。
+///
+/// 原始测试版在构造函数第一件事就是校验它（反汇编 0x4b3c-0x4b7c）：
+///     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+///     if (![bid isEqualToString:@"qingxiugai.qingxiugai.qinxiugai"]) return;
+///
+/// 不匹配就直接退出，什么都不做。这是原版的安全阀 ——
+/// 注入到别的 App 时不会干扰别人，也不会因为内部假设不成立而崩。
+///
+/// 换宿主 App 时改这里。
+static inline NSString *CoreHostBundleID(void) {
+    return @"qingxiugai.qingxiugai.qinxiugai";
+}
 
 /// 宿主首页「社区」按钮跳转地址（← 改成你自己的）
-static inline NSString *COCommunityURL(void) { return @"https://t.me/your_channel"; }
+/// 原始测试版的值是 @"https://t.me/cheatrev"
+static inline NSString *COCommunityURL(void) { return @"https://t.me/cheatrev"; }
+
+#pragma mark - 社群链接
 
 #endif /* CO_VERIFY_CONFIG_H */

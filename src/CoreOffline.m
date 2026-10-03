@@ -623,6 +623,26 @@ static void CoreWaitForHostReady(NSInteger attemptsLeft) {
 __attribute__((constructor))
 static void initializeOffline(void) {
     @autoreleasepool {
+        // ══════════════════════════════════════════════════════════════
+        //  ★★ 第 0 段：宿主包名守卫（照抄原始测试版）
+        //
+        //  原始测试版的构造函数第一件事就是这个（反汇编 0x4b3c-0x4b7c）：
+        //      NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        //      if (![bid isEqualToString:@"qingxiugai.qingxiugai.qinxiugai"])
+        //          return;                     // 不是目标 App 直接退出
+        //
+        //  这是原版的「安全阀」：注入到别的 App 时什么都不做，
+        //  既不会干扰别人，也不会因为假设不成立而崩。
+        //
+        //  注意 bundleIdentifier / mainBundle 在 dyld 阶段是安全的 ——
+        //  原始版实测可用，不属于「早期不安全 API」。
+        // ══════════════════════════════════════════════════════════════
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        if (![bundleID isEqualToString:CoreHostBundleID()]) {
+            // 不是目标宿主，静默退出。连日志都不开。
+            return;
+        }
+
         // ── 第 1 段：零依赖准备（dyld 阶段安全）──
         //
         // CoreLogOpen 走 NSHomeDirectory + open(2)，原始版就是这么干的，

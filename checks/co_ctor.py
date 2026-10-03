@@ -140,6 +140,48 @@ def main():
         else:
             warn("H5 弹窗函数没有子系统守卫（非致命，但建议加）")
 
+    # ── H6: 构造函数必须有宿主包名守卫 ──────────────────────────
+    #
+    # 原始能跑的测试版第一件事就是校验 bundleIdentifier
+    # （反汇编 0x4b3c-0x4b7c）：
+    #     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    #     if (![bid isEqualToString:@"qingxiugai.qingxiugai.qinxiugai"]) return;
+    #
+    # 这是原版的安全阀 —— 注入到别的 App 时什么都不做。
+    # 缺了它就会在任何 App 里跑全套 hook，行为不可预期。
+    if ctor_body is not None:
+        has_guard = ("bundleIdentifier" in ctor_body
+                     and "isEqualToString" in ctor_body)
+        if has_guard:
+            ok("H6 constructor 有宿主包名守卫")
+        else:
+            bad("H6 constructor 缺宿主包名守卫 —— 会在任意 App 里执行 hook")
+
+        # 守卫必须是「提前 return」，不能只是记个标志继续跑。
+        #
+        # 注意两点：
+        #   1) strip_comments 之后仍有多余空行，所以用 \s* 而不是 \s+
+        #   2) 括号里可能嵌套函数调用（isEqualToString:CoreHostBundleID()），
+        #      所以不能用 [^)]* 匹配 —— 会在内层 ")" 处提前截断。
+        #      改成「从 isEqualToString 起，找下一个 { 再找 return;」
+        if re.search(r"isEqualToString[\s\S]{0,200}?\{\s*return\s*;", ctor_body):
+            ok("H6b 守卫是提前 return（不是只记标志）")
+        elif has_guard:
+            warn("H6b 没识别出提前 return 的守卫写法，请人工确认")
+
+    # ── H7: 包名必须来自配置，不能散落在代码里 ──────────────────
+    cfg_path = os.path.join(ROOT, "include", "COVerifyConfig.h")
+    if os.path.exists(cfg_path):
+        cfg = read(cfg_path)
+        if "CoreHostBundleID" in cfg:
+            ok("H7 宿主包名集中在 COVerifyConfig.h")
+        else:
+            warn("H7 建议把宿主包名放进 COVerifyConfig.h")
+    if ctor_body is not None and "CoreHostBundleID()" in ctor_body:
+        ok("H7b constructor 通过 CoreHostBundleID() 读包名")
+    elif ctor_body is not None and "isEqualToString" in ctor_body:
+        warn("H7b constructor 里的包名可能是硬编码字符串")
+
     print()
     print("=" * 74)
     print("结果")
