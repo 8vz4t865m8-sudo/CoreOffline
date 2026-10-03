@@ -166,6 +166,22 @@ static inline BOOL COVerifyAllowOfflineFallback(void) { return YES; }
 static inline NSTimeInterval COVerifyOfflineGrace(void) { return 7 * 24 * 3600.0; }
 
 
+#pragma mark - 保活优先（★ 默认开启，决定「能不能进软件」）
+
+/// 启动自检的总时限（秒）。
+///
+/// 从构造函数起算，超过这个时间还没走到「已授权」，
+/// 就直接给宿主一个远期到期时间放行 —— 绝不把用户关在门外。
+///
+/// ★ 为什么要这个：
+///   用户的原始测试版是**纯离线**的，构造函数里就把状态机跑完，
+///   从来不存在「卡在验证页」这种状态。接了联网验证之后，
+///   一旦网络慢/服务器抖/弹窗出不来，用户就进不去软件 —— 体验是倒退。
+///   这个看门狗保证：最坏情况也只是「没验上但先进去」。
+///
+///   正常网络下 T3 一般 1 秒内就回来了，这个时限根本不会触发。
+static inline NSTimeInterval COVerifyFailOpenAfter(void) { return 12.0; }
+
 #pragma mark - 社群链接
 
 #endif /* CO_VERIFY_CONFIG_H */

@@ -32,9 +32,10 @@ IC = code(os.path.join(SRC, "COIcon.m"))
 #   拿含注释的原文去查字面量，会把注释里举的例子也算成违规 —— J23 就这么误报过。
 CFG_CODE = code(os.path.join(INC, "COVerifyConfig.h"))
 
-P, F = [], []
+P, F, W = [], [], []
 def ok(m): P.append(m)
 def bad(m): F.append(m)
+def warn(m): W.append(m)
 
 print("=" * 74)
 print("J. 逻辑不变量")
@@ -47,11 +48,52 @@ if m and "gDialog = nil" in m.group(0):
 else:
     bad("J1 弹窗回调未清 gDialog —— 验证失败后将永远无法再弹")
 
-# ── J2  失败后必须能重试（重新弹），不能一次失败就锁死
-if re.search(r"license\.denied[\s\S]{0,400}CorePresentLicenseDialog\(\)", CO):
-    ok("J2 验证失败后会重新拉起弹窗，用户可重试")
+# ── J2  失败之后的处理必须「留在弹窗里让用户重输」，**不能**自弹自
+#
+#  ★ 这条检查在「先保证能进去」改造中反过来了。
+#    老实现：失败 → dispatch_after 0.4s → CorePresentLicenseDialog() 重弹。
+#      看起来是「给了重试机会」，实际是**无限弹窗循环**：
+#      每次重弹都要跑一轮动画+布局+一次网络请求，全在同步主线程上，
+#      主线程被占死 → 看门狗、宿主 UI、自动登录回调全部排队 →
+#      用户看到的就是「卡死 / 闪退」。
+#    新实现：失败 **不重弹**，失败原因显示在弹窗的 statusLabel 上，
+#      用户改一个字符再点一次即可 —— 弹窗自己就带这个能力。
+#
+#    所以这里要检查的是：CorePresentLicenseDialog 里**没有**自我调用。
+m_dlg = re.search(r"static void CorePresentLicenseDialog\(void\) \{([\s\S]*?)\n\}\n", CO)
+if m_dlg:
+    body = m_dlg.group(1)
+    # 找出函数体里（排除定义行本身）有没有自己调自己
+    self_calls = len(re.findall(r"\bCorePresentLicenseDialog\(\)", body))
+    if self_calls == 0:
+        ok("J2 弹窗函数不自弹自（失败后留在弹窗里重输，不会死循环占主线程）")
+    else:
+        bad(f"J2 CorePresentLicenseDialog 仍会自我调用 {self_calls} 处 —— 无限弹窗循环")
 else:
-    bad("J2 验证失败后无重试路径")
+    bad("J2 找不到 CorePresentLicenseDialog")
+
+# ── J2b 失败分支必须记录原因，且不得放行
+if re.search(r"license\.denied[\s\S]{0,200}\n\s*\}\s*;", CO) and \
+   not re.search(r"license\.denied[\s\S]{0,200}CoreGrantLicense", CO):
+    ok("J2b 验证失败只记日志、不放行、不重弹")
+else:
+    bad("J2b 验证失败分支行为不正确（可能放行或重弹）")
+
+# ── J5  授权检查必须两条路径都有：缓存有效 / 需要验证
+#
+#  ★ 新实现里「缓存有效」走 CoreGrantLicense(...@"cached")，
+#    不再直接写 gAuthorized = YES —— 统一收口到 CoreGrantLicense。
+m = re.search(r"static void CoreCheckLicense\(void\) \{([\s\S]*?)\n\}\n", CO)
+if m:
+    b = m.group(1)
+    has_valid  = ('CoreGrantLicense(' in b) and ('"cached"' in b)
+    has_dialog = "CorePresentLicenseDialog()" in b
+    if has_valid and has_dialog:
+        ok("J5 授权检查覆盖「缓存有效」与「需验证」两条路径")
+    else:
+        bad(f"J5 授权检查路径不全 valid={has_valid} dialog={has_dialog}")
+else:
+    bad("J5 找不到 CoreCheckLicense")
 
 # ── J3  gDialog 必须在 showIn 之前赋值，否则动画期间的重入会弹两个
 m = re.search(r"gDialog = dlg;\s*\n\s*\[dlg showIn:host\];", CO)
@@ -65,24 +107,16 @@ else:
         bad("J3 找不到 gDialog 与 showIn 的赋值顺序")
 
 # ── J4  弹窗函数开头必须有 gDialog 短路
-m = re.search(r"static void CorePresentLicenseDialog\(void\) \{([\s\S]*?)\n\}", CO)
-if m and re.search(r"if\s*\(gDialog\)\s*return;", m.group(1)):
+if m_dlg and re.search(r"if\s*\(gDialog\)\s*return;", m_dlg.group(1)):
     ok("J4 CorePresentLicenseDialog 有 gDialog 短路")
 else:
     bad("J4 弹窗函数没有防重入短路")
 
-# ── J5  授权检查必须两条路径都有：缓存有效 / 需要验证
-m = re.search(r"static void CoreCheckLicense\(void\) \{([\s\S]*?)\n\}", CO)
-if m:
-    b = m.group(1)
-    has_valid = "gAuthorized = YES" in b
-    has_dialog = "CorePresentLicenseDialog()" in b
-    if has_valid and has_dialog:
-        ok("J5 授权检查覆盖「缓存有效」与「需验证」两条路径")
-    else:
-        bad(f"J5 授权检查路径不全 valid={has_valid} dialog={has_dialog}")
+# ── J4b 拿不到宿主窗口时不得自排重试（老实现 0.35s 后自调 → 无上限递归）
+if m_dlg and not re.search(r"host window[\s\S]{0,300}dispatch_after", m_dlg.group(1)):
+    ok("J4b 拿不到窗口时不自排重试（交给 host-ready 轮询与看门狗）")
 else:
-    bad("J5 找不到 CoreCheckLicense")
+    bad("J4b 拿不到窗口时仍在自排重试 —— 无上限递归风险")
 
 # ── J6  心跳掉线回调必须重置授权态，否则掉线了宿主还以为能用
 if re.search(r"onHeartbeatLost\s*=\s*\^\{[\s\S]{0,300}gAuthorized = NO", CO):
@@ -559,10 +593,143 @@ else:
 
 print()
 print("=" * 74)
+print("R. 保活优先（「一定要能进去」的硬保证）")
+print("=" * 74)
+print()
+
+# ── R1  必须有看门狗：到点无条件放行
+if re.search(r"static void CoreArmFailOpenWatchdog\(void\)", CO):
+    ok("R1 存在 fail-open 看门狗")
+else:
+    bad("R1 没有看门狗 —— 网络/弹窗任何一环卡住，用户就进不去软件")
+
+# ── R2  看门狗必须在构造函数里、**早于**找窗口就挂上
+if re.search(r"CoreArmFailOpenWatchdog\(\);\s*\n[^\n]*CoreWaitForHostReady", CO):
+    ok("R2 看门狗在 CoreWaitForHostReady 之前挂上（先保命再尽力）")
+else:
+    bad("R2 看门狗晚于找窗口 —— 窗口一直不出来时看门狗永远挂不上")
+
+# ── R3  看门狗放行用的是远期到期时间，不是未授权哨兵
+m = re.search(r"static void CoreFailOpen\(const char \*reason\) \{([\s\S]*?)\n\}", CO)
+if m and "COVerifyPerpetualExpiry()" in m.group(1):
+    ok("R3 fail-open 放行用远期到期时间（宿主会认为授权有效）")
+else:
+    bad("R3 fail-open 没用远期到期时间 —— 放了还是进不去")
+
+# ── R4  放行必须收口到一个函数（不然总有路径漏发通知）
+if re.search(r"static void CoreGrantLicense\(NSString \*expiry, NSString \*reason\)", CO):
+    ok("R4 放行收口到 CoreGrantLicense")
+else:
+    bad("R4 放行没做收口 —— 容易漏掉「发通知放行宿主」这一步")
+
+# ── R5  「缓存有效」路径也必须走 CoreGrantLicense（否则通知发不出去）
+m = re.search(r"static void CoreCheckLicense\(void\) \{([\s\S]*?)\n\}\n", CO)
+if m and re.search(r'"cached"', m.group(1)):
+    ok("R5 缓存有效路径也走统一放行出口")
+else:
+    bad("R5 缓存有效路径没走统一出口 —— 宿主可能等不到放行通知")
+
+# ── R6  看门狗等待时长必须是可配置常量（方便按需收紧/关闭）
+if re.search(r"COVerifyFailOpenAfter\(\)", CO) and \
+   re.search(r"static inline NSTimeInterval COVerifyFailOpenAfter", CFG_CODE):
+    ok("R6 看门狗时长由 COVerifyFailOpenAfter() 配置")
+else:
+    bad("R6 看门狗时长写死在代码里 —— 无法按现场情况调整")
+
+# ── R7  看门狗可以被关掉（配 0 = 严格模式）
+if re.search(r"if \(delay <= 0\) return;", CO):
+    ok("R7 看门狗可关（配 0 转严格模式）")
+else:
+    bad("R7 看门狗无法关闭 —— 需要真风控时没有退路")
+
+print()
+print("=" * 74)
+print("S. WS / 网络断联")
+print("=" * 74)
+print()
+
+# ── S1  宿主的 WS 地址必须在黑名单里（用户明确要求掐断）
+if "47.108.53.191" in CO:
+    ok("S1 黑名单含宿主 WS 主机 47.108.53.191")
+else:
+    bad("S1 黑名单没有 47.108.53.191 —— 宿主 WS 拦不住")
+
+# ── S2  拦截黑名单任务时必须真 cancel，不能只是「不转发」
+m = re.search(r"static void CoreTaskResume\(id self, SEL _cmd\) \{([\s\S]*?)\n\}", CO)
+if m and "[task cancel]" in m.group(1):
+    ok("S2 命中黑名单的任务会真 cancel（不是挂起）")
+else:
+    bad("S2 命中黑名单只是不转发 —— 任务永远挂起，宿主会无限重连刷屏")
+
+# ── S3  resume 必须有兜底转发，绝不能因为原实现为 NULL 就吞掉
+if re.search(r"static void CoreHomeFallbackResume\(id self, SEL _cmd\)", CO):
+    ok("S3 resume 有兜底转发（原实现取不到时不会吞掉全部网络）")
+else:
+    bad("S3 resume 没有兜底 —— 原实现为 NULL 时宿主网络全死")
+
+# ── S4  兜底转发的路径必须在非拦截分支里被调用
+m = re.search(r"if \(CoreHomeOriginalResume\) \{[\s\S]{0,120}\} else \{([\s\S]{0,120})\}", CO)
+if m and "CoreHomeFallbackResume" in m.group(1):
+    ok("S4 非拦截请求走「原实现 → 兜底」两级转发")
+else:
+    bad("S4 非拦截请求的转发链不完整")
+
+# ── S5  WS 任务类型要单独识别（日志里能一眼看到掐断了几条 WS）
+if re.search(r"NSURLSessionWebSocketTask", CO):
+    ok("S5 能识别 WS 任务类型（日志区分 WS 与普通请求）")
+else:
+    warn("S5 没有单独识别 WS 任务 —— 日志里分不清掐断的是不是 WS")
+
+# ── S6  cancelNetworkTasks 不能是空壳（必须真扫真取消）
+m = re.search(r"static void cancelNetworkTasks\(void\) \{([\s\S]*?)\n\}", CO)
+if m and "getAllTasksWithCompletionHandler" in m.group(1):
+    ok("S6 cancelNetworkTasks 会扫描并取消在跑的命中任务（非空壳）")
+else:
+    bad("S6 cancelNetworkTasks 是空壳 —— hook 安装前已启动的 WS 永远拦不到")
+
+# ── S7  计数器必须原子递增（对齐测试版反汇编里的 ldaddal）
+if re.search(r"__c11_atomic_fetch_add", CO):
+    ok("S7 拦截计数器用原子递增")
+else:
+    bad("S7 拦截计数器非原子 —— 多线程下是竞态")
+
+print()
+print("=" * 74)
+print("T. 离线兜底不能变成「白送授权」")
+print("=" * 74)
+print()
+
+# ── T1  cachedExpiry 必须挡住未授权哨兵
+m = re.search(r"- \(NSString \*\)cachedExpiry \{([\s\S]*?)\n\}", BR)
+if m and "COVerifyIsUnauthorized" in m.group(1):
+    ok("T1 cachedExpiry 挡住未授权哨兵（不会被当成有效授权）")
+else:
+    bad("T1 cachedExpiry 未挡哨兵 —— 看门狗放行一次以后就永久免验证了")
+
+# ── T2  cachedExpiry 必须挡住永久卡哨兵
+if m and "COVerifyPerpetualExpiry" in m.group(1):
+    ok("T2 cachedExpiry 挡住永久卡哨兵（fail-open 不落盘成长期授权）")
+else:
+    bad("T2 cachedExpiry 未永久卡哨兵 —— 离线放行会变成永久的")
+
+# ── T3  SDK 不可用时要放行而不是拒绝（不能比测试版还不如）
+m = re.search(r"- \(void\)verifyFallbackWithCard:([\s\S]*?)\n\}", BR)
+if m and re.search(r"completion\(YES", m.group(1)):
+    ok("T3 SDK 缺席时放行（不会因为没有 SDK 就把用户关在门外）")
+else:
+    bad("T3 SDK 缺席时拒绝 —— 比纯离线测试版体验还差，方向反了")
+
+print()
+print("=" * 74)
 print(f"  ✅ 通过 {len(P)}   ❌ 失败 {len(F)}")
 print("=" * 74)
 if F:
     print("失败明细：")
     for x in F:
         print("   ❌ " + x)
+print()
+if W:
+    print(f"   ⚠️  {len(W)} 项需人工确认：")
+    for x in W:
+        print("      ⚠️  " + x)
 sys.exit(1 if F else 0)
