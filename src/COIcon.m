@@ -5,6 +5,15 @@
 
 #import "COIcon.h"
 
+/// 只是给 +image:size:color: 用的私有绘制入口。
+/// 这三个要显式拿 color：真实 SDK 没有 CGContextGetStrokeColor，
+/// 取不回「当前的描边色」，所以颜色只能当参数传。
+@interface COIcon ()
++ (void)drawInfo:(CGContextRef)c color:(UIColor *)color;
++ (void)drawTag:(CGContextRef)c color:(UIColor *)color;
++ (void)drawWarn:(CGContextRef)c color:(UIColor *)color;
+@end
+
 @implementation COIcon
 
 #pragma mark - 缓存
@@ -50,13 +59,13 @@ static dispatch_once_t gIconCacheOnce;
         CGContextSetLineJoin(c, kCGLineJoinRound);
 
         switch (type) {
-            case COIconTypeShield:  [self drawShield:c];  break;
-            case COIconTypeKey:     [self drawKey:c];     break;
-            case COIconTypeInfo:    [self drawInfo:c];    break;
-            case COIconTypeTag:     [self drawTag:c];     break;
-            case COIconTypeCheck:   [self drawCheck:c];   break;
-            case COIconTypeCross:   [self drawCross:c];   break;
-            case COIconTypeWarn:    [self drawWarn:c];    break;
+            case COIconTypeShield:  [self drawShield:c];           break;
+            case COIconTypeKey:     [self drawKey:c];              break;
+            case COIconTypeInfo:    [self drawInfo:c color:color]; break;
+            case COIconTypeTag:     [self drawTag:c color:color];  break;
+            case COIconTypeCheck:   [self drawCheck:c];            break;
+            case COIconTypeCross:   [self drawCross:c];            break;
+            case COIconTypeWarn:    [self drawWarn:c color:color]; break;
             case COIconTypeSpinner: [self drawSpinner:c rotation:0]; break;
         }
     }];
@@ -115,13 +124,17 @@ static dispatch_once_t gIconCacheOnce;
 }
 
 /// 圆圈 + i
-+ (void)drawInfo:(CGContextRef)c {
+///
+/// ★ color 要显式传进来：CGContext 没有「取回当前描边色」的公开 API
+///   （不存在 CGContextGetStrokeColor）。以前想「设了描边色再拿来当填充色」，
+///   那个函数在真机 SDK 上根本编译不过 —— 只能把颜色当参数往下传。
++ (void)drawInfo:(CGContextRef)c color:(UIColor *)color {
     CGContextSaveGState(c);
     CGContextAddArc(c, 12, 12, 9.0, 0, (CGFloat)M_PI * 2, 0);
     CGContextStrokePath(c);
 
-    // i 的点
-    CGContextSetFillColorWithColor(c, CGContextGetStrokeColor(c));
+    // i 的点：实心，用同一个颜色
+    CGContextSetFillColorWithColor(c, color.CGColor);
     CGContextAddArc(c, 12, 7.6, 1.15, 0, (CGFloat)M_PI * 2, 0);
     CGContextFillPath(c);
 
@@ -133,7 +146,7 @@ static dispatch_once_t gIconCacheOnce;
 }
 
 /// 标签：带孔的吊牌
-+ (void)drawTag:(CGContextRef)c {
++ (void)drawTag:(CGContextRef)c color:(UIColor *)color {
     CGContextSaveGState(c);
     CGMutablePathRef p = CGPathCreateMutable();
     CGPathMoveToPoint(p, NULL, 3.5, 4.0);
@@ -146,8 +159,8 @@ static dispatch_once_t gIconCacheOnce;
     CGContextStrokePath(c);
     CGPathRelease(p);
 
-    // 吊孔
-    CGContextSetFillColorWithColor(c, CGContextGetStrokeColor(c));
+    // 吊孔：实心
+    CGContextSetFillColorWithColor(c, color.CGColor);
     CGContextAddArc(c, 8.0, 8.6, 1.3, 0, (CGFloat)M_PI * 2, 0);
     CGContextFillPath(c);
     CGContextRestoreGState(c);
@@ -177,7 +190,7 @@ static dispatch_once_t gIconCacheOnce;
 }
 
 /// 三角 + 感叹号
-+ (void)drawWarn:(CGContextRef)c {
++ (void)drawWarn:(CGContextRef)c color:(UIColor *)color {
     CGContextSaveGState(c);
     CGMutablePathRef p = CGPathCreateMutable();
     CGPathMoveToPoint(p, NULL, 12, 3.2);
@@ -188,7 +201,8 @@ static dispatch_once_t gIconCacheOnce;
     CGContextStrokePath(c);
     CGPathRelease(p);
 
-    CGContextSetFillColorWithColor(c, CGContextGetStrokeColor(c));
+    // 感叹号的点：实心
+    CGContextSetFillColorWithColor(c, color.CGColor);
     CGContextAddArc(c, 12, 16.8, 1.1, 0, (CGFloat)M_PI * 2, 0);
     CGContextFillPath(c);
 

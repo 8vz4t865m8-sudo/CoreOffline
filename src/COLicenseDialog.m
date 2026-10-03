@@ -464,12 +464,16 @@ static const NSTimeInterval kCODismissDuration = 0.20;
     CGFloat overlap = MAX(0, root.bounds.size.height - inRoot.origin.y);
     _keyboardHeight = overlap;
 
+    // ★ 必须带 completion: —— UIKit 里 animateWithDuration:delay:options:animations:
+    //   这个「无 completion」的重载其实不存在（只有带 completion 的那版）。
+    //   传 nil 即可，行为一样。
     [UIView animateWithDuration:dur
                           delay:0
                         options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionBeginFromCurrentState
                      animations:^{
         [self layoutCardInBounds:root.bounds.size];
-    }];
+    }
+                     completion:nil];
 }
 
 #pragma mark - 布局（★ 全部在这里算，别处不许改 frame）

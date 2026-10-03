@@ -9,6 +9,12 @@
 #import "T3Verify.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
+#if TARGET_OS_IOS
+// getMachineCode 在 iOS 分支里用 UIDevice 取 IDFV。
+// 原版 SDK 漏了这个 import（Mac 上编译不到那一段所以没暴露），
+// 编成 iOS dylib 时会在 UIDevice 处报 undeclared identifier。
+#import <UIKit/UIKit.h>
+#endif
 
 // 服务器地址
 static NSString *const T3_ALL_SERVERS_UNAVAILABLE = @"无法连接到所有T3网络验证服务器，可能是因为您的网络问题或T3网络验证服务器被攻击造成的，建议检查网络或稍后重试";
