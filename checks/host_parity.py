@@ -87,6 +87,45 @@ for sym, pat in HOST_SYMBOLS.items():
     else:
         bad("H2 缺少 %s 的定义 —— 宿主的 dlsym 跳板会走「跳过」分支" % sym)
 
+# H2b ★ CoreRemoteOpen 的 handle 参数是「宿主算好的内存地址」，绝不能解引用
+#     调用点反汇编：
+#       0x10003a7a8  ldr  x8, [x8, #0x4a8]   ; 全局指针
+#       0x10003a7b4  ldr  w9, [x9]           ; 全局 int
+#       0x10003a7b8  add  x0, x8, x9         ; x0 = 基址 + 偏移
+#     那块内存属于宿主、可能尚未初始化 —— 解引用就是踩空指针。
+_ro = re.search(r"void\s*\*\s*CoreRemoteOpen\s*\(([^)]*)\)\s*\{(.*?)\n\}", code, re.S)
+if _ro:
+    _params, _body = _ro.group(1), _ro.group(2)
+    _hdls = re.findall(r"\b(\w+)\b", _params.split(",")[0]) if _params.strip() else []
+    _h = _hdls[-1] if _hdls else None
+    if _h:
+        # 解引用形态：*h 、h[...] 、h-> 、strlen(h)/strcmp(h,...) 等
+        _deref = re.search(r"\*\s*%s\b|%s\s*\[|%s\s*->|strlen\s*\(\s*%s|strcmp\s*\([^)]*\b%s\b"
+                           % (_h, _h, _h, _h, _h), _body)
+        if _deref:
+            bad("H2b CoreRemoteOpen 解引用了 handle(%s) —— 那是宿主的内存，可能未初始化" % _h)
+        else:
+            ok("H2b CoreRemoteOpen 不解引用 handle(%s)，只当数值用" % _h)
+    if re.search(r"return\s+NULL\s*;", _body):
+        ok("H2c CoreRemoteOpen 返回 NULL（宿主会当句柄用，非 NULL 会跳错约定）")
+    else:
+        bad("H2c CoreRemoteOpen 未返回 NULL —— 宿主会把它当有效句柄使用")
+
+# H2d ★ 5 个注入点都必须有 @try 兜底（它们在宿主主流程上）
+_impl = re.search(r"//  ★★★ 宿主预留的 5 个注入接口", code)
+if _impl is None:
+    # 注释被剥掉了，改判：5 个函数体里是否有 @try
+    _fns = ["CoreOfflineBootstrap", "CoreOfflinePrepare", "CoreOfflineFinalize", "CoreRemoteFault"]
+    _miss = []
+    for _f in _fns:
+        _m = re.search(r"\b%s\s*\([^)]*\)\s*\{(.*?)\n\}" % _f, code, re.S)
+        if _m and "@try" not in _m.group(1):
+            _miss.append(_f)
+    if _miss:
+        warn("H2d 这些注入点没有 @try 兜底: %s" % ", ".join(_miss))
+    else:
+        ok("H2d 4 个有函数体的注入点全部有 @try 兜底")
+
 # H3 ★ 主接管点必须是 QXA117 finish:authorized:message:expiresAt:
 if "finish:authorized:message:expiresAt:" in code:
     ok("H3 主接管点 = QXA117 finish:authorized:message:expiresAt: （收敛点）")

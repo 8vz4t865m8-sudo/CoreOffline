@@ -2,25 +2,32 @@
 //  CoreOffline.m —— 宿主 Core 1.6 卡密接管版  (v3 · 全部签名经反汇编核实)
 //
 //  ── v3 相对 v2 的关键变化 ────────────────────────────────────────────────
-//  ★★★ 导出宿主预留的三个 C 符号 ★★★
+//  ★★★ 导出宿主预留的 5 个 C 符号 ★★★
 //
-//  宿主二进制里内置了三个「弱符号跳板」（weak import trampoline），
-//  它们会主动 dlsym 查找下面三个符号：
+//  宿主二进制里内置了 5 个「dlsym 跳板」，会主动查找并调用这 5 个符号：
 //
-//      CoreOfflineBootstrap   @0x100003464 (符号名字符串所在偏移)
-//      CoreOfflinePrepare     @0x100003564
-//      CoreOfflineFinalize    @0x100003664
+//      CoreOfflineBootstrap   @0x100003464  ← 跳板 0x100003400，调用点 0x10019ba28
+//      CoreOfflinePrepare     @0x100003564  ← 跳板 0x100003500，调用点 0x10008ec80
+//      CoreOfflineFinalize    @0x100003664  ← 跳板 0x100003600，调用点 0x10008cec4
+//      CoreRemoteOpen         @0x100003864  ← 跳板 0x100003800，调用点 0x10003a7d4
+//      CoreRemoteFault        @0x100003964  ← 跳板 0x100003900，调用点 0x100039844
 //
-//  跳板代码（宿主 __text 最前端，0x100003400 起）：
+//  跳板代码（宿主 __text 最前端，0x100003400 起，5 个结构完全相同）：
+//      100003408  stp  x0, x1, [sp]  ...             ; 保存全部参数寄存器
 //      100003420  mov  x0, #-2                       ; RTLD_DEFAULT
 //      100003424  adr  x1, #"CoreOfflineBootstrap"
 //      100003428  bl   #0x100725a10                  ; dlsym
-//      ...
-//      100003450  cbz  x16, skip                     ; NULL 就跳过
-//      100003454  xpaci x16 ; br x16                 ; 有就执行
+//      100003430  ldp  x0, x1, [sp]  ...             ; 恢复全部参数
+//      100003450  cbz  x16, #0x10000345c             ; NULL 就返回 0
+//      100003454  xpaci x16 ; br x16                 ; 有就执行（参数原样透传）
 //
-//  ★ 所以本 dylib 必须**导出**这三个符号（visibility default，非 static）。
-//    宿主会主动来调用 —— 这比 constructor / +load 的时机可靠得多。
+//  ★ 所以本 dylib 必须**导出**这 5 个符号（visibility default，非 static）。
+//
+//  ★★ 关键认识：这 5 个点是「功能留白」而不是「可选回调」。
+//     宿主调用点都是 `b`（尾调用），跳板的 ret 回到调用者的上一层，
+//     所以宿主自己跟在后面的那段代码是**死代码** —— 宿主把它留空，
+//     等的就是注入方来实现。宿主未注入任何 dylib 时这 5 处全部扑空，
+//     这就是「什么都不做也崩」的结构性原因。
 //
 //  ── 接管策略 ────────────────────────────────────────────────────────────
 //    主接管点：QXA117 finish:authorized:message:expiresAt:  @0x10017a5dc
@@ -41,13 +48,15 @@
 //    ① 自己手动调 completion block，参数个数靠猜（实测是 4 参数）
 //    ② constructor 里 objc_copyClassList 全量遍历 119 个类
 //    ③ 引 Security.framework + Keychain（自签下 SecItemAdd = -34018）
+//    ④ ★ 宿主预留的 5 个注入点一个都没实现（宿主自己那段是死代码）
 //
 //  ── 本版原则 ────────────────────────────────────────────────────────────
 //    1. 绝不自己调用任何 completion block
 //    2. 零全局类遍历，只按名字取 4 个确定的类
 //    3. 零 Keychain / 零 Security / 零 CFNetwork 依赖
 //    4. 安装幂等，所有 hook 体 @try/@catch 兜底
-//    5. 导出宿主预留的 3 个符号
+//    5. 导出宿主预留的 5 个符号，且全部「不做实事、立刻返回」
+//       CoreRemoteOpen 必须返回 NULL（宿主会当句柄用）
 //
 //  依赖：仅 Foundation + UIKit
 // ═══════════════════════════════════════════════════════════════════════════
@@ -427,59 +436,93 @@ static void COScheduleInstall(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ★★★ 宿主预留的注入接口 ★★★
+//  ★★★ 宿主预留的 5 个注入接口 —— 这是「功能留白」，不是「可选回调」★★★
 //
-//  宿主的 __text 最前端内置了三个「弱符号跳板」（弱导入 weak_import）：
+//  【机制】宿主在 5 个位置各放了一条**无条件 b 指令**，尾调用进跳板：
 //
-//      100003400  mov  x0, #-2              ; RTLD_DEFAULT
-//      100003424  adr  x1, #"CoreOfflineBootstrap"
-//      100003428  bl   dlsym
-//      100003450  cbz  x16, skip            ; 找不到就跳过
-//      100003458  br   x16                  ; 找到就调用
+//      跳板（以 Bootstrap 为例，0x100003400）：
+//        pacibsp
+//        stp  x0, x1, [sp] ...          ; 保存全部 8 个参数寄存器 + x29/x30
+//        mov  x0, #-2                   ; RTLD_DEFAULT
+//        adr  x1, "CoreOfflineBootstrap" ; 符号名（在跳板内，adr 相对寻址）
+//        bl   dlsym                     ; 找我们的导出符号
+//        mov  x16, x0
+//        ldp  x0, x1, [sp] ...          ; 恢复全部参数
+//        cbz  x16, L_null               ; 没找到 → 走 L_null
+//        xpaci x16                      ; ★ 解签名（所以我们导出未签名的普通 C 函数）
+//        br   x16                       ; 找到 → 跳进我们的实现（参数原样透传）
+//      L_null:
+//        mov  x0, #0
+//        ret
 //
-//  三个符号名（硬编码在宿主二进制里）：
-//      CoreOfflineBootstrap   @0x100003464
-//      CoreOfflinePrepare     @0x100003564
-//      CoreOfflineFinalize    @0x100003664
+//  【为什么这是「留白」而不是「回调」】
+//    宿主调用点是这样的：
+//        0x10008ec80  b  #0x100003500      ; ← 跳到 CoreOfflinePrepare 跳板
+//        0x10008ec84  sub sp, sp, #0x1f0   ; ← 宿主「原本的实现」，变成死代码
+//    因为 `b` 是尾调用，跳板里的 `ret` 回到的是**调用 0x10008ec80 的那一层**，
+//    而不是 0x10008ec84。所以：
+//      · 没找到符号 → 直接返回给上层，0x10008ec84 那段永远不执行
+//      · 找到符号   → 执行我们的函数，我们 ret 同样回到上层
+//    两种情况宿主自己那段都被跳过 —— 宿主把那几处留空，等的就是注入方来填。
 //
-//  ★ 所以 dylib **必须导出这三个 C 符号**（默认可见性，不能 static）。
-//    宿主会主动来 dlsym 找我们 —— 这比 constructor/+load 的时机更可靠。
+//  【5 个点的完整清单（全部实测反汇编确认）】
 //
-//  ★★ 完整清单是 **5 个**（本轮全量扫描 dlsym 跳板所得）：
+//    跳板地址     dlsym 符号名              字符串 @        调用点         性质
+//    0x100003400  CoreOfflineBootstrap      0x100003464    0x10019ba28    启动/清理路径
+//    0x100003500  CoreOfflinePrepare        0x100003564    0x10008ec80    初始化（网络前）
+//    0x100003600  CoreOfflineFinalize       0x100003664    0x10008cec4    收尾（dealloc 路径）
+//    0x100003800  CoreRemoteOpen            0x100003864    0x10003a7d4    读全局状态
+//    0x100003900  CoreRemoteFault           0x100003964    0x100039844    异常上报
 //
-//      跳板地址     dlsym 符号名              字符串 @        调用点
-//      0x100003400  CoreOfflineBootstrap      0x100003464    0x10019ba28
-//      0x100003500  CoreOfflinePrepare        0x100003564    0x10008ec80
-//      0x100003600  CoreOfflineFinalize       0x100003664    0x10008cec4
-//      0x100003800  CoreRemoteOpen            0x100003864    0x10003a7d4
-//      0x100003900  CoreRemoteFault           0x100003964    0x100039844
+//  【调用约定（逐个反汇编所得，★ 本轮修正）】
 //
-//  ★ 后两个的调用约定（反汇编所得）：
-//      CoreRemoteOpen  @0x10003a7d4
-//          10003a7b8  add x0, x8, x9       ; x0 = 字符串/句柄指针
-//          ...
-//          （可能还有 x1 = options，但调用点未显式设置）
-//      CoreRemoteFault @0x100039844
-//          100039830  adrp x1, #0x10073d000
-//          100039834  add  x1, x1, #0x6ae  ; x1 = "exception-filter-reply-failed"
-//          100039838  mov  w0, #3          ; x0 = mode = 3
-//          → CoreRemoteFault(uint64_t mode, const char *reason)
+//    · CoreOfflineBootstrap / Prepare / Finalize
+//        无显式入参，返回值被宿主忽略。
+//        跳板透传 x0~x7，我们拿到的是宿主调用点的原始寄存器值 —— 不要假设含义。
 //
-//  ★ 注意：不要在这里面做任何可能抛异常的事；
-//    宿主是在它的初始化流程里调的，崩了就是整个 app 崩。
-//    所以全部逻辑包 @try/@catch。
+//    · CoreRemoteOpen  @0x10003a7d4
+//        调用点前文：
+//          0x10003a7a4  adrp x8, #0x100c53000
+//          0x10003a7a8  ldr  x8, [x8, #0x4a8]   ; 全局指针
+//          0x10003a7b0  add  x9, x9, #0x354
+//          0x10003a7b4  ldr  w9, [x9]           ; 全局 int
+//          0x10003a7b8  add  x0, x8, x9         ; ★ x0 = 全局对象基址 + 偏移
+//        所以 x0 **不是函数名、不是字符串，是一个已算好的内存地址**。
+//        （v3 早期版本把它当 const char * 打印是错的，已修正为只记数值。）
+//        ★ 必须返回 NULL —— 宿主会把它当句柄用，返回非 NULL 会跳进对不上的约定。
 //
-//  ★ 另外：这些函数**只是可选的诊断上报点**（宿主用 cbz 判 NULL），
-//    不导出也不会崩，但导出才能让宿主走「找到」分支。
-//    我们导出它们的意义是：① CI 断言要求；② 万一宿主想上报，给它一个安全的落点。
+//    · CoreRemoteFault @0x100039844
+//        调用点前文：
+//          0x100039830  adrp x1, #0x10073d000
+//          0x100039834  add  x1, x1, #0x6ae      ; x1 = "exception-filter-reply-failed"
+//          0x100039838  mov  w0, #3              ; w0 = 3
+//          0x10003983c  bl   #0x100039844        ; 调到跳板
+//          0x100039840  b    #0x1000397fc        ; ★ 返回值被完全忽略
+//        → CoreRemoteFault(uint64_t mode, const char *reason)
+//        ★ 返回值无关紧要（宿主 bl 完就 b 走了），但不能崩、不能阻塞。
+//
+//  【铁律】
+//    ① 绝不做任何可能抛异常的事 —— 全部包 @try/@catch
+//    ② 绝不阻塞（不等待、不 sleep、不发网络请求）—— 这些点在宿主主流程上
+//    ③ CoreRemoteOpen 必须返回 NULL
+//    ④ 日志也要防崩（COLog 内部有保护），并加静态计数器防日志淹没
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 引导：宿主最早的调用点。装 hook 的主要时机。
+// 计数器：这 5 个点可能被高频调用，日志只打前若干次
+static int gBootCalls = 0;
+static int gPrepCalls = 0;
+static int gFinCalls  = 0;
+static int gOpenCalls = 0;
+static int gFaultCalls = 0;
+#define CO_LOG_EVERY 8   // 前 8 次全打，之后每 8 次打一次
+
+/// 引导：宿主启动/清理路径上的必经点。装 hook 的时机。
 __attribute__((visibility("default")))
 void CoreOfflineBootstrap(void) {
+    gBootCalls++;
     @try {
         @autoreleasepool {
-            COLog("════════ [宿主调用] CoreOfflineBootstrap ════════");
+            COLog("════════ [宿主调用] CoreOfflineBootstrap (#%d) ════════", gBootCalls);
             COInstall();
         }
     } @catch (NSException *e) {
@@ -487,56 +530,78 @@ void CoreOfflineBootstrap(void) {
     }
 }
 
-/// 准备：环境就绪后宿主会再调一次。幂等，重复调用无副作用。
+/// 准备：宿主初始化早期（网络初始化之前）调用。幂等，重复调用无副作用。
 __attribute__((visibility("default")))
 void CoreOfflinePrepare(void) {
+    gPrepCalls++;
     @try {
         @autoreleasepool {
-            COLog("════════ [宿主调用] CoreOfflinePrepare ════════");
+            if (gPrepCalls <= CO_LOG_EVERY || (gPrepCalls % CO_LOG_EVERY) == 0) {
+                COLog("════════ [宿主调用] CoreOfflinePrepare (#%d) ════════", gPrepCalls);
+            }
             COInstall();   // 幂等
-            COLog("[Prepare] 计数器 fp=%d net=%d binder=%d ui=%d",
-                  gDidFP, gDidNet, gDidBinder, gDidUI);
         }
     } @catch (NSException *e) {
         COLog("[Prepare] 异常已吞: %s", [[e reason] UTF8String]);
     }
 }
 
-/// 远端资源打开（宿主 @0x10003a7d4 调用，x0 = 指针）。
+/// 远端状态查询（宿主 @0x10003a7d4 调用）。
+///
+/// ★ x0 是宿主算好的「全局对象基址 + 偏移」地址，**不是字符串**。
+///   我们只把它当数值记录，绝不解引用（那是宿主的内存，可能还没初始化）。
+///
 /// ★ 一律返回 NULL —— 表示「我这边没有额外的远端句柄」。
-///   绝不能返回非 NULL，否则宿主会拿它当有效句柄去用。
+///   绝不能返回非 NULL：宿主会拿它当有效句柄用，而我们对不上它的结构。
 __attribute__((visibility("default")))
-void *CoreRemoteOpen(const char *name, uint64_t options) {
-    @try {
-        @autoreleasepool {
-            COLog("[宿主调用] CoreRemoteOpen name=%s options=%llu → 返回 NULL",
-                  name ? name : "(nil)", (unsigned long long)options);
-        }
-    } @catch (NSException *e) { }
+void *CoreRemoteOpen(uint64_t opaque_handle, uint64_t arg2) {
+    gOpenCalls++;
+    if (gOpenCalls <= CO_LOG_EVERY || (gOpenCalls % CO_LOG_EVERY) == 0) {
+        @try {
+            @autoreleasepool {
+                // ★ 不解引用 opaque_handle —— 只记录数值
+                COLog("[宿主调用] CoreRemoteOpen (#%d) handle=0x%llx arg2=0x%llx → 返回 NULL",
+                      gOpenCalls,
+                      (unsigned long long)opaque_handle,
+                      (unsigned long long)arg2);
+            }
+        } @catch (NSException *e) { }
+    }
     return NULL;
 }
 
-/// 异常上报（宿主 @0x100039844 调用，x0 = mode = 3，x1 = reason 字符串）。
-/// ★ 只记日志，原样返回 mode，不做任何实际动作。
+/// 异常上报（宿主 @0x100039844 调用，w0 = mode = 3，x1 = reason 字符串）。
+/// ★ 返回值被宿主忽略（bl 完就 b 走了），原样返回 mode 即可。
+///   只记日志，不做任何实际动作。
 __attribute__((visibility("default")))
 uint64_t CoreRemoteFault(uint64_t mode, const char *reason) {
-    @try {
-        @autoreleasepool {
-            COLog("[宿主调用] CoreRemoteFault mode=%llu reason=%s",
-                  (unsigned long long)mode, reason ? reason : "(nil)");
-        }
-    } @catch (NSException *e) { }
+    gFaultCalls++;
+    if (gFaultCalls <= CO_LOG_EVERY || (gFaultCalls % CO_LOG_EVERY) == 0) {
+        @try {
+            @autoreleasepool {
+                // reason 是宿主的 __cstring 字面量，读它是安全的
+                COLog("[宿主调用] CoreRemoteFault (#%d) mode=%llu reason=%s",
+                      gFaultCalls,
+                      (unsigned long long)mode,
+                      reason ? reason : "(null)");
+            }
+        } @catch (NSException *e) { }
+    }
     return mode;
 }
 
-/// 收尾：宿主流程结束时调用。只做日志，不做任何有风险的事。
+/// 收尾：宿主流程结束时（dealloc 路径）调用。只做日志，不做任何有风险的事。
 __attribute__((visibility("default")))
 void CoreOfflineFinalize(void) {
+    gFinCalls++;
     @try {
         @autoreleasepool {
-            COLog("════════ [宿主调用] CoreOfflineFinalize ════════");
-            COLog("[Finalize] 累计 fp=%d net=%d binder=%d ui=%d",
-                  gDidFP, gDidNet, gDidBinder, gDidUI);
+            if (gFinCalls <= CO_LOG_EVERY || (gFinCalls % CO_LOG_EVERY) == 0) {
+                COLog("════════ [宿主调用] CoreOfflineFinalize (#%d) ════════", gFinCalls);
+                COLog("[Finalize] 累计 boot=%d prep=%d open=%d fault=%d | hook fp=%d net=%d binder=%d ui=%d",
+                      gBootCalls, gPrepCalls, gOpenCalls, gFaultCalls,
+                      gDidFP, gDidNet, gDidBinder, gDidUI);
+            }
         }
     } @catch (NSException *e) {
         COLog("[Finalize] 异常已吞: %s", [[e reason] UTF8String]);

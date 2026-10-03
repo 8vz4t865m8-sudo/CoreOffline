@@ -189,6 +189,48 @@ jobs:
           echo "✅ 未回退到 v2 的 verifyDeviceIdentifier: 路径"
 
           echo
+          echo "════════ ★★★ 注入点实现安全断言 ════════"
+          # 这 5 个符号是宿主「功能留白」的填充点，跑在宿主主流程上。
+          # 必须确认实现里没有危险动作。
+          python3 - <<'PY2'
+          import re, sys
+          src = open("src/CoreOffline.m", encoding="utf-8").read()
+          code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+          code = re.sub(r"//[^\n]*", "", code)
+          bad = []
+
+          m = re.search(r"void\s*\*\s*CoreRemoteOpen\s*\(([^)]*)\)\s*\{(.*?)\n\}", code, re.S)
+          if not m:
+              bad.append("找不到 CoreRemoteOpen 定义")
+          else:
+              params, body = m.group(1).strip(), m.group(2)
+              h = params.split(",")[0].replace("uint64_t","").strip() if params else ""
+              if not re.search(r"return\s+NULL\s*;", body):
+                  bad.append("CoreRemoteOpen 没返回 NULL —— 宿主会当句柄用")
+              if h and re.search(r"\*\s*%s\b|%s\s*\[|strlen\s*\(\s*%s" % (h,h,h), body):
+                  bad.append("CoreRemoteOpen 解引用了 handle(%s) —— 宿主内存可能未初始化" % h)
+
+          # 5 个注入点里不允许出现阻塞/网络调用
+          for fn in ["CoreOfflineBootstrap","CoreOfflinePrepare","CoreOfflineFinalize",
+                     "CoreRemoteOpen","CoreRemoteFault"]:
+              fm = re.search(r"\b%s\s*\([^)]*\)\s*\{(.*?)\n\}" % fn, code, re.S)
+              if not fm: continue
+              b = fm.group(1)
+              for pat, why in [(r"\bsleep\s*\(", "sleep 阻塞"),
+                               (r"NSURLSession|NSURLConnection", "网络请求"),
+                               (r"dispatch_sync", "dispatch_sync 可能死锁"),
+                               (r"@synchronized", "@synchronized 可能阻塞")]:
+                  if re.search(pat, b):
+                      bad.append("%s 内有 %s" % (fn, why))
+
+          if bad:
+              print("❌ 注入点实现存在风险：")
+              for x in bad: print("   - " + x)
+              sys.exit(1)
+          print("✅ 5 个注入点：无阻塞 / 无网络 / CoreRemoteOpen 返回 NULL 且不解引用")
+          PY2
+
+          echo
           echo "════════ 反模式断言（源码层面已查过，这里查二进制）════════"
           # 卡密验证的「实现代码」不应该出现在我们的 dylib 里。
           # 注意：QXA117 等只是**类名字符串**（用于 NSClassFromString），
