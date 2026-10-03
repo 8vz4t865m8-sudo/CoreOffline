@@ -12,7 +12,9 @@ CoreOffline 审计
 """
 import os, re, subprocess, sys
 
-ROOT = "/root/.codebuddy/artifact/coreoffline"
+# ROOT 自动探测：取本脚本所在目录的上一级。
+# 这样本地沙箱和 CI 上都能跑，不用改路径。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC  = os.path.join(ROOT, "src")
 INC_DIR = os.path.join(ROOT, "include")
 SDK  = os.path.join(ROOT, "sdk")
@@ -45,20 +47,29 @@ CODE  = {f: strip_comments(v) for f, v in TEXT.items()}
 print("=" * 74)
 print("A. 语法检查")
 print("=" * 74)
-for f in ALL_M:
-    cmd = ["clang", "-fsyntax-only", "-fblocks", "-fobjc-arc",
-           "-fobjc-runtime=gnustep-2.0", "-std=gnu11", "-Wno-everything"] + INC + \
-          [os.path.join(SRC, f)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode == 0:
-        ok(f"A 语法 {f}")
-        print(f"  ✅ {f}")
-    else:
-        bad(f"A 语法 {f}")
-        print(f"  ❌ {f}")
-        for line in r.stderr.splitlines():
-            if re.search(r"(error|fatal error):", line):
-                print("       " + line.strip())
+
+# 这套检查靠 /tmp/uishim + /tmp/objcshim 替身头做 iOS 语法仿真。
+# 替身头是本地沙箱手工搭的（CI 上没有），缺了就跳过 A 节 ——
+# 不能在 CI 上把它当成失败，否则会掩盖真正的问题。
+_HAS_SHIM = all(os.path.isdir(p) for p in ("/tmp/uishim", "/tmp/objcshim"))
+if not _HAS_SHIM:
+    print("  ⏭  跳过：未找到替身头 /tmp/uishim + /tmp/objcshim")
+    print("      （CI 上属正常，本地跑请先搭好替身头）")
+else:
+    for f in ALL_M:
+        cmd = ["clang", "-fsyntax-only", "-fblocks", "-fobjc-arc",
+               "-fobjc-runtime=gnustep-2.0", "-std=gnu11", "-Wno-everything"] + INC + \
+              [os.path.join(SRC, f)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            ok(f"A 语法 {f}")
+            print(f"  ✅ {f}")
+        else:
+            bad(f"A 语法 {f}")
+            print(f"  ❌ {f}")
+            for line in r.stderr.splitlines():
+                if re.search(r"(error|fatal error):", line):
+                    print("       " + line.strip())
 
 print()
 print("=" * 74)

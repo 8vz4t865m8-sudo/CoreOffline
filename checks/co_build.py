@@ -10,7 +10,9 @@ CoreOffline 构建一致性检查
 """
 import os, re, sys
 
-ROOT = "/root/.codebuddy/artifact/coreoffline"
+# ROOT 自动探测：取本脚本所在目录的上一级。
+# 这样本地沙箱和 CI 上都能跑，不用改路径。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MK   = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
 YML  = open(os.path.join(ROOT, ".github/workflows/build.yml"), encoding="utf-8").read()
 

@@ -8,7 +8,9 @@ CoreOffline 逻辑不变量检查（比结构审计更深一层）
 """
 import os, re, sys
 
-ROOT = "/root/.codebuddy/artifact/coreoffline"
+# ROOT 自动探测：取本脚本所在目录的上一级。
+# 这样本地沙箱和 CI 上都能跑，不用改路径。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
 INC = os.path.join(ROOT, "include")
 
