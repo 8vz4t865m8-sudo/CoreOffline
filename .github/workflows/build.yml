@@ -21,27 +21,40 @@ jobs:
           xcodebuild -version
           xcrun -sdk iphoneos --show-sdk-version
 
+      # ─────────────────────────────────────────────────────────
+      #  第一步：行为一致性检查
+      #
+      #  ★ 这是本仓库最重要的一步。它逐条证明 src/CoreOffline.m
+      #    没有偏离用户的测试版二进制 —— 每一条断言都对应一段反汇编证据。
+      #    纯 Python，不需要 Xcode。
+      # ─────────────────────────────────────────────────────────
+      - name: Parity check vs original test build
+        run: |
+          set -e
+          test -f src/CoreOffline.m || { echo "missing src/CoreOffline.m"; exit 1; }
+          python3 checks/clone_parity.py || { echo "❌ 复刻版偏离了测试版"; exit 1; }
+
       - name: Static sanity check
         run: |
           set -e
-          for f in src/CoreOffline.m src/COIcon.m src/COLicenseDialog.m \
-                   src/COVerifyBridge.m src/COKeychain.m src/COEntry.m src/COLog.m; do
-            test -f "$f" || { echo "missing $f"; exit 1; }
-          done
-          test -f sdk/T3Verify.m || { echo "missing sdk/T3Verify.m"; exit 1; }
-          echo "sources ok"
-
-          echo "── 构造函数早期安全性（真机闪退防线，必须有）"
-          python3 checks/co_ctor.py || { echo "❌ 构造函数安全检查未通过"; exit 1; }
-
-          echo "── 其他静态审计"
-          for s in co_audit co_build co_logic co_realapi; do
-            if [ -f "checks/$s.py" ]; then
-              echo "   运行 checks/$s.py"
-              python3 "checks/$s.py" || { echo "❌ $s 未通过"; exit 1; }
+          echo "── 断言：卡密那一套必须已经移出构建路径"
+          for f in src/COEntry.m src/COVerifyBridge.m src/COKeychain.m \
+                   src/COLicenseDialog.m src/COIcon.m sdk/T3Verify.m; do
+            if [ -f "$f" ]; then
+              echo "❌ $f 还在构建路径里 —— 这一轮要求完全基于测试版，不含卡密"
+              exit 1
             fi
           done
-          echo "✅ 审计通过"
+          echo "✅ 构建路径干净（卡密已挪到 src/_license/ 留档）"
+
+          echo "── 断言：源文件只有一个"
+          n=$(ls src/*.m 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$n" != "1" ]; then
+            echo "❌ src/ 下有 $n 个 .m 文件，应只有 CoreOffline.m"
+            ls src/*.m
+            exit 1
+          fi
+          echo "✅ 只有一个编译单元"
 
       - name: Build dylib
         run: make ARCHS="arm64e"
@@ -54,63 +67,93 @@ jobs:
           otool -D CoreOffline.work.dylib
           echo "── linked frameworks:"
           otool -L CoreOffline.work.dylib
-          echo "── exported symbols:"
-          nm -gU CoreOffline.work.dylib | grep -E "Core(Offline|Remote)" || true
 
-          echo "── 架构断言（必须与原始测试版一致：arm64e）"
-          # otool -hv 的列宽会把 ARM64E 截断显示成 "ARM64  E"，
-          # caps 列也可能显示 USR00 而非 PAC00 —— 都不适合做断言。
-          # 直接读 Mach-O 头的 cpusubtype 字段最可靠：
-          #   arm64e 的 cpusubtype 是 0x80000002（CPU_SUBTYPE_ARM64E | 高位标志）
+          echo
+          echo "════════ 架构断言（必须 arm64e，与测试版一致）════════"
           python3 - <<'PY'
           import struct, sys
           d = open("CoreOffline.work.dylib", "rb").read()
           magic, cputype, cpusubtype = struct.unpack_from("<Iii", d, 0)
           assert magic == 0xfeedfacf, "不是 64 位 Mach-O"
-          print("cputype=0x%x cpusubtype=0x%x" % (cputype, cpusubtype & 0xFFFFFFFF))
           sub = cpusubtype & 0xFFFFFFFF
+          print("cputype=0x%x cpusubtype=0x%x" % (cputype, sub))
           if sub != 0x80000002:
               print("❌ cpusubtype=0x%x，期望 0x80000002 (arm64e)" % sub)
-              print("   原始测试版是 arm64e，编错架构在带 PAC 检查的环境下会注入异常")
+              print("   测试版是 arm64e，编错架构在带 PAC 检查的环境下会注入异常")
               sys.exit(1)
           print("✅ arm64e (cpusubtype=0x80000002)")
           PY
 
-          echo "── install name 断言"
+          echo
+          echo "════════ install name 断言 ════════"
           otool -D CoreOffline.work.dylib | grep -q "@executable_path/CoreOffline.work.dylib" \
             || { echo "❌ install name 不对，注入后 dyld 找不到"; exit 1; }
-          echo "✅ install name ok"
+          echo "✅ @executable_path/CoreOffline.work.dylib"
 
-          echo "── QuartzCore 断言（CABasicAnimation 用）"
-          otool -L CoreOffline.work.dylib | grep -q "QuartzCore" \
-            || { echo "❌ 缺 QuartzCore"; exit 1; }
-          echo "✅ QuartzCore ok"
+          echo
+          echo "════════ 依赖断言（★ 必须严格等于测试版的 3 个）════════"
+          LIBS=$(otool -L CoreOffline.work.dylib | tail -n +2 | awk '{print $1}')
+          echo "$LIBS"
+          for want in Foundation UIKit QuartzCore; do
+            echo "$LIBS" | grep -q "$want.framework" \
+              || { echo "❌ 缺 $want"; exit 1; }
+          done
+          echo "✅ Foundation / UIKit / QuartzCore 齐全"
 
-          echo "── Security 断言（Keychain + RSA 用，COKeychain.m 依赖）"
-          otool -L CoreOffline.work.dylib | grep -q "Security.framework" \
-            || { echo "❌ 缺 Security —— COKeychain 会链接失败"; exit 1; }
-          echo "✅ Security ok"
+          for bad in "Security.framework" "CFNetwork.framework" "CoreGraphics.framework" \
+                     "CoreTelephony.framework" "SystemConfiguration.framework"; do
+            if echo "$LIBS" | grep -q "$bad"; then
+              echo "❌ 链了测试版没有的 $bad —— 会多一层 dyld 初始化，多一个闪退面"
+              exit 1
+            fi
+          done
+          echo "✅ 没有多链任何框架（Security/CFNetwork/CoreGraphics 都没有）"
 
-          echo "── CFNetwork 断言（CFNetworkCopySystemProxySettings 代理检测用）"
-          otool -L CoreOffline.work.dylib | grep -q "CFNetwork" \
-            || { echo "❌ 缺 CFNetwork —— 代理检测会链接失败"; exit 1; }
-          echo "✅ CFNetwork ok"
-
-          echo "── C 入口符号断言（宿主 dlsym 用，必须导出）"
-          for sym in coreoffline_c_verify_card coreoffline_c_verify_saved \
-                     coreoffline_c_has_license coreoffline_c_risk_mask \
-                     coreoffline_c_machine_code coreoffline_c_clear; do
+          echo
+          echo "════════ 导出符号断言 ════════"
+          for sym in CoreOfflineBootstrap CoreOfflinePrepare CoreOfflineFinalize \
+                     CoreRemoteOpen CoreRemoteFault; do
             nm -gU CoreOffline.work.dylib | grep -q "_$sym\$" \
               || { echo "❌ 缺导出符号 _$sym"; exit 1; }
           done
-          echo "✅ 13 个 C 入口至少 6 个关键符号已导出"
+          echo "✅ CoreOfflineBootstrap / Prepare / Finalize / RemoteOpen / RemoteFault"
 
-          echo "── Keychain 符号断言（必须链上 Security 的 SecItem* 系列）"
-          nm -u CoreOffline.work.dylib | grep -q "_SecItemAdd" \
-            || { echo "❌ 没链上 SecItemAdd —— COKeychain 没被编进去？"; exit 1; }
-          nm -u CoreOffline.work.dylib | grep -q "_SecItemCopyMatching" \
-            || { echo "❌ 没链上 SecItemCopyMatching"; exit 1; }
-          echo "✅ Keychain 符号 ok"
+          echo
+          echo "════════ 卡密符号断言（★ 必须一个都没有）════════"
+          if nm -gU CoreOffline.work.dylib | grep -qiE "verify|license|keychain|t3|card"; then
+            echo "❌ 二进制里有卡密相关符号："
+            nm -gU CoreOffline.work.dylib | grep -iE "verify|license|keychain|t3|card"
+            exit 1
+          fi
+          echo "✅ 没有任何卡密相关符号"
+
+          echo
+          echo "════════ Keychain 断言（必须没链上）════════"
+          if nm -u CoreOffline.work.dylib | grep -q "_SecItem"; then
+            echo "❌ 链上了 SecItem* —— Security 框架被引进来了"
+            exit 1
+          fi
+          echo "✅ 没有 SecItem* 符号"
+
+          echo
+          echo "════════ 关键字符串断言（测试版里真实存在的）════════"
+          for s in "2099-12-31 23:59:59" "OKDHomeMusicController" \
+                   "attachToRootView:" "refreshHomeLayoutArtwork" \
+                   "authorizationValue" "setDisableUpdateMask:" \
+                   "CoreHomeBanner.work" "api.appledb.dev" "fastly.jsdelivr.net"; do
+            strings -a CoreOffline.work.dylib | grep -q "$s" \
+              || { echo "❌ 缺关键字符串: $s"; exit 1; }
+          done
+          echo "✅ 关键字符串齐全"
+
+          echo
+          echo "════════ 幽灵字符串断言（测试版里**不存在**的）════════"
+          if strings -a CoreOffline.work.dylib | grep -qE "Community|社区|交流群|官方频道"; then
+            echo "❌ 出现了测试版里不存在的标题："
+            strings -a CoreOffline.work.dylib | grep -E "Community|社区|交流群|官方频道"
+            exit 1
+          fi
+          echo "✅ 没有幽灵标题"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

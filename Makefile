@@ -1,10 +1,11 @@
 # ─────────────────────────────────────────────────────────────
-#  CoreOffline —— 授权验证 dylib
+#  CoreOffline —— 测试版 1:1 复刻
 #
 #  构建（需 macOS + Xcode）：
 #     make                        # 默认 arm64e（与原始测试版一致）
 #     make ARCHS="arm64"          # 仅 arm64
 #     make ARCHS="arm64 arm64e"   # 双切片 fat（自动调 lipo）
+#     make check                  # 行为一致性检查（不需要 macOS）
 #     make clean
 #
 #  产物：CoreOffline.work.dylib
@@ -16,6 +17,16 @@
 #    必须用 `-target arm64e-apple-ios<ver>` 才会得到
 #    0x80000002（arm64e，带 PAC）。
 #    而 `-target` 一次只能指定一个架构，所以多架构走「分别编译 + lipo」。
+#
+#  ★★ 关于依赖（这是复刻版最关键的一点）：
+#    原始测试版的 LC_LOAD_DYLIB 只有 3 个 framework：
+#        Foundation / UIKit / QuartzCore
+#    外加系统自动带的 libobjc / libSystem / CoreFoundation。
+#
+#    所以这里**故意**不链 Security、不链 CFNetwork、不链 CoreGraphics。
+#    少一个框架 = 少一个 dyld 阶段可能出问题的点。
+#    卡密那一套（T3Verify / COVerifyBridge / Keychain / 弹窗）已经挪到
+#    src/_license/ 留档，等这一步验证「能进」之后再重新接回来。
 # ─────────────────────────────────────────────────────────────
 
 SDK      ?= iphoneos
@@ -29,32 +40,22 @@ LIPO      = xcrun -sdk $(SDK) lipo
 
 OUT      = CoreOffline.work.dylib
 
-# 源码清单：dylib 本体 + 主题/图标/桥接/弹窗 + 密钥链 + C 入口
-SRC      = src/CoreOffline.m \
-           src/COIcon.m \
-           src/COLicenseDialog.m \
-           src/COVerifyBridge.m \
-           src/COKeychain.m \
-           src/COEntry.m \
-           src/COLog.m \
-           sdk/T3Verify.m
+# ★★ 源码清单：**只有一个文件**。测试版也就是一个 TU。
+#    卡密那一套全部在 src/_license/，本 Makefile 不引用。
+SRC      = src/CoreOffline.m
 
 # 头文件搜索路径
-INC      = -Iinclude -Isrc -Isdk
+INC      = -Iinclude -Isrc
 
-# 链接的框架：
-#   Foundation / UIKit  —— 基础
-#   CoreGraphics        —— COIcon 手绘矢量图标（CGContext 那套）
-#   QuartzCore          —— CABasicAnimation，提交按钮里的转圈动画
-#   Security            —— T3 SDK 的 RSA 公钥解密 + Keychain（COKeychain）
-#                          + CommonCrypto（CC_SHA256）随它一起进来
-#   CFNetwork           —— CFNetworkCopySystemProxySettings（代理/VPN 检测）
+# ★★ 链接的框架：严格对齐测试版的 3 个。
 #
-# ★ CFNetwork 是 F5CloudAuth 有、原测试版没有的 —— 加它是为了风控自检。
-#   注意：这两个框架都**不能**在 constructor 早期路径里碰（见 co_ctor.py 的 H 节）。
-FRAMEWORKS = -framework Foundation -framework UIKit \
-             -framework CoreGraphics -framework QuartzCore \
-             -framework Security -framework CFNetwork
+#    绝对不能加：
+#      Security      —— Keychain / RSA，卡密那套才会引进来
+#      CFNetwork     —— 代理/VPN 自检，测试版没有
+#      CoreGraphics  —— COIcon 手绘图标，测试版没有（它只链 QuartzCore）
+#
+#    加任何一个都会让 dyld 阶段多一层初始化，多一个闪退面。
+FRAMEWORKS = -framework Foundation -framework UIKit -framework QuartzCore
 
 # 公共编译参数（不含架构选择 —— 架构用 -target 逐个指定）
 COMMON   = -dynamiclib -fobjc-arc -O2 -Wall -Wno-unused-variable \
@@ -89,7 +90,12 @@ $(OUT): $(SRC)
 	ls -l $(OUT)
 endif
 
+# 行为一致性检查：证明复刻版没有偏离测试版
+# 纯 Python，任何机器都能跑，不需要 macOS。
+check:
+	@python3 checks/clone_parity.py
+
 clean:
 	rm -f $(OUT) .slice-*
 
-.PHONY: all clean
+.PHONY: all clean check
