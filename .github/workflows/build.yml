@@ -56,12 +56,24 @@ jobs:
           echo "── exported symbols:"
           nm -gU CoreOffline.work.dylib | grep -E "Core(Offline|Remote)" || true
 
-          echo "── 架构断言（必须与原始测试版一致：arm64e / PAC00）"
-          otool -hv CoreOffline.work.dylib | grep -q "ARM64E" \
-            || { echo "❌ 架构不是 arm64e —— 原始测试版是 arm64e(PAC00)，编错架构会导致注入异常"; exit 1; }
-          otool -hv CoreOffline.work.dylib | grep -q "PAC00" \
-            || { echo "❌ 缺少 PAC00 标记"; exit 1; }
-          echo "✅ arm64e (PAC00)"
+          echo "── 架构断言（必须与原始测试版一致：arm64e）"
+          # otool -hv 的列宽会把 ARM64E 截断显示成 "ARM64  E"，
+          # caps 列也可能显示 USR00 而非 PAC00 —— 都不适合做断言。
+          # 直接读 Mach-O 头的 cpusubtype 字段最可靠：
+          #   arm64e 的 cpusubtype 是 0x80000002（CPU_SUBTYPE_ARM64E | 高位标志）
+          python3 - <<'PY'
+          import struct, sys
+          d = open("CoreOffline.work.dylib", "rb").read()
+          magic, cputype, cpusubtype = struct.unpack_from("<Iii", d, 0)
+          assert magic == 0xfeedfacf, "不是 64 位 Mach-O"
+          print("cputype=0x%x cpusubtype=0x%x" % (cputype, cpusubtype & 0xFFFFFFFF))
+          sub = cpusubtype & 0xFFFFFFFF
+          if sub != 0x80000002:
+              print("❌ cpusubtype=0x%x，期望 0x80000002 (arm64e)" % sub)
+              print("   原始测试版是 arm64e，编错架构在带 PAC 检查的环境下会注入异常")
+              sys.exit(1)
+          print("✅ arm64e (cpusubtype=0x80000002)")
+          PY
 
           echo "── install name 断言"
           otool -D CoreOffline.work.dylib | grep -q "@executable_path/CoreOffline.work.dylib" \

@@ -179,6 +179,40 @@ if not missing_fw:
 else:
     bad("K10 Makefile 漏链框架（会链接失败）：" + "; ".join(missing_fw))
 
+# ── K11 arm64e 必须用 -target，光靠 -arch 会静默降级成 arm64
+#
+# 这是真机上踩过的坑：Makefile 写 `-arch arm64e`，编译不报任何错，
+# 但产物的 cpusubtype 是 0x0（普通 arm64）而不是 0x80000002（arm64e）。
+# 原因：-arch 在多架构/fat 场景下由 driver 决定最终 target，
+#       单编 dylib 时会退回默认 target（arm64）。
+# 正确做法是 -target arm64e-apple-ios<ver>。
+#
+# ★ 只看「含 -target 的变量定义行」和「真正调 $(CC) 的行」，
+#   不能扫全文 —— 注释里也会提到 -target，会造成假阳性。
+build_lines = []
+for line in MK.splitlines():
+    s = line.strip()
+    if s.startswith("#"):
+        continue
+    if re.match(r"^(COMMON|CFLAGS|SLICES)\s*[:?+]?=", s) or "$(CC)" in s:
+        build_lines.append(line)
+build_text = "\n".join(build_lines)
+
+if "arm64e" in MK:
+    if "-target" in build_text and "-apple-ios" in build_text:
+        ok("K11 编译命令行用 -target 三元组（arm64e 不会被降级）")
+    else:
+        bad("K11 编译命令行没有 -target 三元组 —— cpusubtype 会静默变成 0x0")
+else:
+    warn("K11 Makefile 里没有 arm64e（如果目标就是 arm64 可忽略）")
+
+# ── K12 多架构必须走 lipo（-target 一次只能一个架构）
+if re.search(r"ARCHS\s*\?=\s*\S+\s+\S+", MK) or "ARCHS=\"arm64 arm64e\"" in MK:
+    if "lipo" in MK:
+        ok("K12 多架构走 lipo 合成")
+    else:
+        bad("K12 提到多架构但没有 lipo —— -target 不能一次指定多个架构")
+
 print()
 print("=" * 74)
 print(f"  ✅ 通过 {len(P)}   ❌ 失败 {len(F)}")
