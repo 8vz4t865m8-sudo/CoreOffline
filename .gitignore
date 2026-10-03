@@ -1,0 +1,21 @@
+# 构建产物
+*.dylib
+*.o
+*.a
+build/
+dist/
+
+# macOS
+.DS_Store
+__MACOSX/
+._*
+*.swp
+*~
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# 本地日志
+*.log
