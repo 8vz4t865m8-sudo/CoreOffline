@@ -117,16 +117,35 @@ for fn, body in FILES.items():
 if not any("L5" in x for x in F):
     ok("L5 NSInvocation 索引都从 2 起（未覆盖 self/_cmd）")
 
-# ── L6 __unsafe_unretained 用在 getReturnValue 上（对象出参必须用这个）
+# ── L6 __unsafe_unretained 用在 getReturnValue 上（**对象**出参必须用这个）
+#
+# ★ 规则边界：只有被写的变量是**对象指针**时才需要 __unsafe_unretained。
+#   标量（BOOL / int / long long）不需要，也不该标 ——
+#   __unsafe_unretained 只对 object pointer 类型有定义。
+#   所以这里先判断变量的声明类型，是标量就跳过。
 for fn, body in FILES.items():
     if "getReturnValue:" in body:
-        # 检查被传的变量是否标了 __unsafe_unretained
         for m in re.finditer(r"getReturnValue:&(\w+)", body):
             var = m.group(1)
-            if not re.search(r"__unsafe_unretained\s+\w+\s+" + re.escape(var) + r"\b", body):
-                bad(f"L6 {fn} getReturnValue:&{var} 未标 __unsafe_unretained")
+            # 找这个变量的声明，看类型里有没有指针/对象
+            decl = re.search(r"^[ \t]*([\w \t\*_]*?)\b"
+                             + re.escape(var) + r"\s*=\s*[^;]*;",
+                             body, re.M)
+            if not decl:
+                continue
+            vtype = decl.group(1)
+            # 标量类型白名单：BOOL / int / long long / NSInteger / char ...
+            if re.fullmatch(r"\s*(__unsafe_unretained\s+)?"
+                            r"(BOOL|bool|char|short|int|long|long long|"
+                            r"NSInteger|NSUInteger|CGFloat|double|float|"
+                            r"unsigned\s+\w+|int64_t|uint64_t)\s*",
+                            vtype):
+                continue
+            if not re.search(r"__unsafe_unretained\s+[\w \t\*]*\b"
+                             + re.escape(var) + r"\b", body):
+                bad(f"L6 {fn} getReturnValue:&{var} 是对象出参却未标 __unsafe_unretained")
 if not any("L6" in x for x in F):
-    ok("L6 getReturnValue 出参都标了 __unsafe_unretained")
+    ok("L6 getReturnValue 的对象出参都标了 __unsafe_unretained（标量已排除）")
 
 # ── L7 objc_copyClassList 出参必须是 __unsafe_unretained Class *
 for fn, body in FILES.items():

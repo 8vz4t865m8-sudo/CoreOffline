@@ -70,6 +70,15 @@ static BOOL gAuthorized = NO;
 /// 验证弹窗持有者 —— 必须强引用，否则一挂到 view 上就被释放了
 static COLicenseDialog *gDialog = nil;
 
+/// 自动登录是否还在进行中。
+///
+/// ★ 为什么要这个标志：
+///   自动登录是异步的网络请求，期间用户可能已经手动把验证页拉出来了
+///   （比如从 C 入口 coreoffline_c_present_dialog 调进来）。
+///   这时候自动登录**成功**回来，弹窗就得自动收掉 ——
+///   否则会出现「已经授权了，弹窗还杵在那儿」的怪状态。
+static BOOL gAutoLoginInFlight = NO;
+
 /// 宿主根控制器（用来挂弹窗）
 static __weak UIViewController *gHostController = nil;
 
@@ -191,6 +200,12 @@ static void CorePresentLicenseDialog(void) {
         return;
     }
 
+    // 已经授权了就别再弹 —— 自动登录成功之后可能还有排队的调用进来
+    if (gAuthorized) {
+        record("license.dialog SKIPPED (already authorized)");
+        return;
+    }
+
     UIViewController *host = CoreTopViewController();
     if (!host) {
         // 窗口还没就绪，等一拍再来
@@ -228,10 +243,17 @@ static void CorePresentLicenseDialog(void) {
 
     gDialog = dlg;
     [dlg showIn:host];
-    record("license.dialog.present");
+    record("license.dialog.present autologin_inflight=%d", (int)gAutoLoginInFlight);
 }
 
 /// 检查授权状态，需要的话弹验证页
+///
+/// 流程（照用户原测试版的体验：打开就进，别让人重输）：
+///   1. 本地缓存里有**未过期**的授权 → 直接用，不弹窗
+///   2. 缓存过期/没有，但存过卡密 → **静默自动登录**一次
+///        · 成功 → 直接放行（用户无感）
+///        · 失败 → 弹验证页，并预填上次的卡密
+///   3. 什么都没存 → 弹验证页
 static void CoreCheckLicense(void) {
     NSString *expiry = CoreLicenseExpiryString();
     // ★ 用哨兵判断而不是 hasPrefix:@"1970" —— 后者一旦别人改了
@@ -243,6 +265,52 @@ static void CoreCheckLicense(void) {
         record("license.cached.valid expiry=%s", expiry.UTF8String);
         return;
     }
+
+    // ── 第 2 步：存过卡密就自动登录 ──
+    // ★ 为什么必须有这一步：
+    //   没有它的话，用户每次开 App 都要重新输一遍卡密 ——
+    //   而原测试版是「打开就直接用」的。不补这个，用户会觉得功能倒退了。
+    NSString *savedCard = [COVerifyBridge shared].cachedCard;
+    if (savedCard.length > 0) {
+        record("license.autologin try card=***%s",
+               savedCard.length >= 4 ? savedCard.UTF8String + savedCard.length - 4 : "****");
+        gAutoLoginInFlight = YES;
+
+        [[COVerifyBridge shared] verifyCard:savedCard
+                                 completion:^(BOOL ok, NSString *newExpiry,
+                                              NSString *stateCode, NSString *message) {
+            gAutoLoginInFlight = NO;
+            if (ok) {
+                gAuthorized = YES;
+                score = credential;
+                record("license.autologin GRANTED expiry=%s",
+                       newExpiry.UTF8String ?: "-");
+
+                // ★ 如果自动登录期间弹窗已经被拉出来了（用户手快点了什么），
+                //   现在既然已经授权，就得把它收掉 ——
+                //   否则会出现「已经放行了，验证框还杵在屏幕上」的怪状态。
+                //
+                //   用公开的 -dismiss（不触发 onResult）而不是带 completion 的私有方法：
+                //   这里不需要回调，而且 dismiss 就是「关掉、不通知」的语义，
+                //   正好避免 onResult 里的失败分支又把它弹回来。
+                COLicenseDialog *openDlg = gDialog;
+                if (openDlg) {
+                    gDialog = nil;
+                    [openDlg dismiss];
+                    record("license.autologin dismissed open dialog");
+                }
+
+                [[NSNotificationCenter defaultCenter]
+                    postNotificationName:@"CoreOfflineLicenseGranted" object:nil];
+                return;
+            }
+            // 自动登录失败 → 退回弹窗，把卡密预填上让用户改
+            record("license.autologin FAILED msg=%s", message.UTF8String ?: "-");
+            CorePresentLicenseDialog();
+        }];
+        return;
+    }
+
     record("license.required");
     CorePresentLicenseDialog();
 }

@@ -442,11 +442,120 @@ if n_fb_logs >= 3:
 else:
     bad(f"O8 兜底日志只有 {n_fb_logs} 条 —— 出问题查不到")
 
-# ── O9 服务器地址必须可配（换 IP 不用重新编译逻辑）
-if "COVerifyBaseURL" in CFG_CODE and "COVerifyHost" in CFG_CODE and "COVerifyPort" in CFG_CODE:
-    ok("O9 服务器地址可配（baseURL + host/port 两条路）")
+# ── O9 服务器地址的来源必须清楚
+#
+#   T3 SDK 把地址硬编码在 sdk/T3Verify.m 的 T3ServerURLs() 里，
+#   init 洗牌 + 请求时逐个重试（它自己的容灾）。
+#   配置头**不该**再留一份 baseURL/host/port —— 那会让人以为要手配，
+#   而且真配了反而会绕开 SDK 的故障转移。
+SDK_F = os.path.join(ROOT, "sdk", "T3Verify.m")
+sdk_text = open(SDK_F, encoding="utf-8").read() if os.path.exists(SDK_F) else ""
+n_servers = len(re.findall(r'@"https://[\w.]+/"', sdk_text))
+if n_servers >= 2:
+    ok(f"O9 服务器地址在 SDK 里（{n_servers} 个轮询点，自带容灾）")
 else:
-    bad("O9 服务器地址写死 —— 换服务器要改代码")
+    bad("O9 SDK 里找不到服务器地址 —— 请求会打到空 URL")
+
+# 配置头里不能有「填地址」的残留配置项，否则误导使用者
+if re.search(r"COVerifyBaseURL|COVerifyHost\b|COVerifyPort\b", CFG_CODE):
+    bad("O9 配置头还留着 BaseURL/Host/Port —— 会让人以为要手配，"
+        "且配了会绕开 SDK 自带的服务器轮询")
+else:
+    ok("O9 配置头没有多余的地址配置项（不误导使用者）")
+
+# ==========================================================================
+# P. T3 SDK 对接正确性
+#
+#    ★★ 这一节防的是一个「看起来完全正常、实际永远验证不过」的坑：
+#
+#    T3 的 T3LoginResult 在**成功**时才带上 code=200；
+#    失败时它只有 success=NO + error=@"..."，**根本没有 code 字段**。
+#
+#    所以如果成功判定写成「读 code，等于 1/200 才算过」，
+#    code 永远是 nil → 判定永远为 NO → 卡密再对也进不去，
+#    而且错误提示还会显示成一个笼统的"验证失败"，让人以为是卡密问题。
+#
+#    这类 bug 编译能过、单测（如果只 mock 成功路径）也能过，
+#    只有在真机上拿真卡密试才会暴露。所以必须用静态检查钉死。
+# ==========================================================================
+
+# ── P1 成功判定必须以 success 字段为准
+if re.search(r"respondsToSelector:\s*NSSelectorFromString\(@\"success\"\)", BR) or \
+   re.search(r"@selector\(success\)", BR) or '"success"' in BR:
+    ok("P1 成功判定读了 T3LoginResult.success（不再只认 code）")
+else:
+    bad("P1 成功判定没读 success —— T3 失败结果没有 code 字段，会导致卡密永远验不过")
+
+# ── P2 成功判定不能只认 code
+if re.search(r"COSuccessOfResult", BR):
+    ok("P2 成功判定走 COSuccessOfResult（success 优先、code 兜底）")
+else:
+    bad("P2 缺少 COSuccessOfResult —— 成功判定逻辑散落，容易退回只认 code")
+
+# ── P3 失败原因必须能读到 T3 的 error 字段
+#      否则用户只看到"验证失败"，分不清卡密错还是网络错
+if re.search(r'@\[@"error",\s*@"msg"', BR) or re.search(r'"error"\s*,\s*"msg"', BR):
+    ok("P3 失败原因优先读 error 字段（与 T3 的形状一致）")
+else:
+    bad("P3 失败原因没读 error —— T3 的失败文案在 error 不在 msg，用户看不到真实原因")
+
+# ── P4 RSA 初始化失败必须拒绝工作
+#      吞掉 RSA 初始化错误 = 用 nil 编解码器跑，表现是「卡密对却验不过」
+if re.search(r"if\s*\(\s*!setupOK\s*\)", BR) or re.search(r"if\s*\(\s*!initOK\s*\)", BR):
+    ok("P4 RSA 初始化失败会拒绝工作（不带着坏编解码器硬跑）")
+else:
+    bad("P4 RSA 初始化返回值被忽略 —— 公钥填错时会表现为「卡密永远验证失败」")
+
+# ── P5 装配失败的原因要能透出来
+if re.search(r"setupError", BR) or re.search(r"initError", BR):
+    ok("P5 装配失败原因有留存（能告诉用户是公钥错还是版本不兼容）")
+else:
+    bad("P5 装配失败原因被丢弃 —— 出问题只能靠猜")
+
+# ── P6 NSInvocation 的 error 出参下标必须是 8
+#      (loginCode,noticeCode,versionCode,heartbeatCode,appkey,rsaPublicKey,error*)
+#      → self(0) _cmd(1) 之后 6 个对象占 2..7，error 在 8
+if re.search(r"atIndex:8", BR):
+    ok("P6 RSA 初始化的 error 出参下标为 8（与 7 参签名一致）")
+else:
+    bad("P6 RSA 初始化 error 出参下标不对 —— 错误信息会写到别人的槽位")
+
+# ── P7 初始化参数个数校验：不能只靠 respondsToSelector
+#      nil 对象对任何 selector 都返回 NO，会把「init 失败」误判成「用别的初始化方式」
+if re.search(r"init\s+returned\s+nil", BR) or re.search(r"if\s*\(\s*!inst\s*\)", BR):
+    ok("P7 检查了 init 返回值（nil 对象不会骗过 respondsToSelector）")
+else:
+    bad("P7 没检查 init 返回值 —— init 失败时被 respondsToSelector 的 nil 语义骗过去")
+
+# ==========================================================================
+# Q. 启动体验（照用户原测试版：打开就进，不让人反复输卡密）
+#    CO 已在文件开头定义为「剥注释版 CoreOffline.m」
+# ==========================================================================
+
+# ── Q1 存过卡密必须自动登录
+#      缺了这一步，用户每次开 App 都要重输 —— 相对原测试版是体验倒退
+if re.search(r"autologin", CO):
+    ok("Q1 启动时会对已存卡密做静默自动登录")
+else:
+    bad("Q1 没有自动登录 —— 用户每次开 App 都得重输卡密，比原测试版还难用")
+
+# ── Q2 自动登录失败必须退回弹窗（不能静默卡在未授权）
+if re.search(r"autologin\s+FAILED", CO):
+    ok("Q2 自动登录失败会退回验证弹窗")
+else:
+    bad("Q2 自动登录失败没有退路 —— 用户会卡在未授权且看不到输入框")
+
+# ── Q3 已授权后不再重复弹窗
+if re.search(r"already authorized", CO):
+    ok("Q3 已授权时弹窗会被短路（不会重复弹）")
+else:
+    bad("Q3 已授权仍可能弹窗 —— 自动登录成功后会闪一下验证框")
+
+# ── Q4 自动登录成功要收掉已经开着的弹窗
+if re.search(r"dismissed open dialog", CO):
+    ok("Q4 自动登录成功会收掉已打开的弹窗")
+else:
+    warn("Q4 自动登录成功时若弹窗已开，可能残留（竞态窗口很小但存在）")
 
 print()
 print("=" * 74)

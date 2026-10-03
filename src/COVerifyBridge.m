@@ -242,8 +242,12 @@ static NSDate *COParseExpiry(NSString *s) {
 @property (nonatomic, assign) BOOL     loggedIn;
 @property (nonatomic, assign) NSInteger heartbeatFail;
 @property (nonatomic, strong) NSTimer *heartbeatTimer;
-@property (nonatomic, copy)   NSString *cachedCardStore;
-@property (nonatomic, copy)   NSString *cachedExpiryStore;
+@property (nonatomic, strong) NSString *cachedCardStore;
+@property (nonatomic, strong) NSString *cachedExpiryStore;
+
+/// 装配失败的原因。用于把「SDK 没接上 / RSA 公钥填错 / 版本不兼容」
+/// 这几种情况的真实原因透给用户，而不是笼统地说一句"验证失败"。
+@property (nonatomic, copy, nullable) NSString *setupError;
 
 @end
 
@@ -309,62 +313,176 @@ static NSDate *COParseExpiry(NSString *s) {
 
 #pragma mark - SDK 装配
 
+/// 验证服务器条数 —— 只用于日志。
+///
+/// T3 SDK 内部硬编码了 6 个服务器轮询地址（w / w2..w5.t3yanzheng.com、
+/// w.t3data.net），由 SDK 自己随机打乱后逐个重试，**不需要外部配置**。
+/// 这里只是为了让日志能一眼看出「到底有几个服务器可试」。
+static NSInteger COServerCount(void) { return 6; }
+
 - (void)setupSDK {
     Class cls = NSClassFromString(@"T3Verify");
     if (!cls) {
         _sdkUsable = NO;
-        NSLog(@"[CoreOffline] T3Verify SDK 未接入，卡密验证走本地缓存降级");
+        CORecord("license.sdk absent → local fallback");
         return;
     }
 
     @try {
-        id inst = ((id (*)(id, SEL))objc_msgSend)([cls alloc], @selector(init));
+        // ★ init 可能返回 nil（父类 init 失败）。
+        //   直接往下走会在 nil 上发消息 —— 不崩但会被 respondsToSelector
+        //   的 nil 语义骗过去（nil 对任何 selector 都返回 NO），
+        //   于是静默落到「明文模式」分支，RSA 公钥白填。
+        id alloced = [cls alloc];
+        id inst = ((id (*)(id, SEL))objc_msgSend)(alloced, @selector(init));
+        if (!inst) {
+            _sdkUsable = NO;
+            CORecord("license.sdk init returned nil");
+            return;
+        }
 
         // initRsaWithLoginCode:noticeCode:versionCode:heartbeatCode:appkey:rsaPublicKey:error:
         SEL initSel = @selector(initRsaWithLoginCode:noticeCode:versionCode:heartbeatCode:appkey:rsaPublicKey:error:);
-        if (![inst respondsToSelector:initSel]) {
-            // 可能用的是明文模式
-            SEL plainSel = @selector(initWithLoginCode:noticeCode:versionCode:heartbeatCode:appkey:error:);
-            if ([inst respondsToSelector:plainSel]) {
-                NSError *err = nil;
-                [self callInitOn:inst selector:plainSel error:&err];
+        if ([inst respondsToSelector:initSel]) {
+            // ★ 这个初始化返回 BOOL，**失败必须让整个验证拒绝工作**，
+            //   不能吞掉错误硬着头皮往下跑。
+            //
+            //   为什么：RSA 初始化失败 = 编码器/解码器是 nil。
+            //   此时请求参数还是明文，但解码响应那一步会直接失败，
+            //   表现出来就是「卡密正确却一直提示验证失败」——
+            //   用户根本无从判断是卡密错了还是公钥填错了。
+            //   宁可现在就说清楚，也别让用户在那儿反复试卡密。
+            NSError *setupErr = nil;
+            BOOL setupOK = NO;
+            @try {
+                setupOK = [self callRsaInitOn:inst selector:initSel error:&setupErr];
+            } @catch (NSException *e) {
+                setupOK = NO;
+                if (!setupErr) {
+                    setupErr = [NSError errorWithDomain:@"CoreOffline"
+                                                  code:-1
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                             e.reason ?: @"初始化抛异常"}];
+                }
             }
+
+            if (!setupOK) {
+                _sdkUsable = NO;
+                _verifyInstance = nil;
+                _setupError = setupErr.localizedDescription
+                             ?: @"RSA 初始化失败（请检查 RSA 公钥是否完整，"
+                                @"必须带 -----BEGIN PUBLIC KEY----- 头尾和换行）";
+                CORecord("license.sdk rsa_init FAILED: %s", _setupError.UTF8String);
+                NSLog(@"[CoreOffline] T3 RSA 初始化失败：%@", _setupError);
+                return;
+            }
+
             _sdkUsable = YES;
-        } else {
-            NSError *err = nil;
-            [self callInitOn:inst selector:initSel error:&err];
-            _sdkUsable = YES;
+            _verifyInstance = inst;
+            CORecord("license.sdk ready mode=rsa servers=%d",
+                     (int)COServerCount());
+            NSLog(@"[CoreOffline] T3Verify SDK 已装配（RSA 模式）");
+            return;
         }
 
-        _verifyInstance = inst;
-        NSLog(@"[CoreOffline] T3Verify SDK 已装配");
+        // 兼容旧版 SDK 的明文模式（没找到 RSA 接口才走这里）
+        SEL plainSel = @selector(initWithLoginCode:noticeCode:versionCode:heartbeatCode:appkey:error:);
+        if ([inst respondsToSelector:plainSel]) {
+            [self callPlainInitOn:inst selector:plainSel];
+            _sdkUsable = YES;
+            _verifyInstance = inst;
+            CORecord("license.sdk ready mode=plain");
+            NSLog(@"[CoreOffline] T3Verify SDK 已装配（明文模式）");
+            return;
+        }
+
+        // 类在、但两个初始化接口都不认 —— 版本对不上，别硬用
+        _sdkUsable = NO;
+        _verifyInstance = nil;
+        _setupError = @"T3Verify 版本不兼容（找不到已支持的初始化方法）";
+        CORecord("license.sdk incompatible");
     } @catch (NSException *e) {
         _sdkUsable = NO;
+        _verifyInstance = nil;
+        _setupError = [NSString stringWithFormat:@"验证器装配异常：%@", e.reason ?: @"未知"];
+        CORecord("license.sdk setup EXCEPTION: %s", (e.reason ?: @"?").UTF8String);
         NSLog(@"[CoreOffline] T3Verify 装配失败: %@", e.reason);
     }
 }
 
-/// 用 NSInvocation 发初始化消息：参数多、有出参指针，performSelector 撑不住
-- (void)callInitOn:(id)inst selector:(SEL)sel error:(NSError **)err {
+/// 发 RSA 初始化消息（7 个字符串 + 1 个 NSError** 出参，performSelector 撑不住）。
+///
+/// ★ 下标要点：NSInvocation 的 index 0 = self，1 = _cmd，
+///   **第一个显式参数从 index 2 开始**。
+///   方法签名是 (loginCode, noticeCode, versionCode, heartbeatCode, appkey, rsaPublicKey, error*)
+///   → index 2,3,4,5,6,7 是 6 个对象，index 8 是 error。
+- (BOOL)callRsaInitOn:(id)inst selector:(SEL)sel error:(NSError **)err {
+    NSMethodSignature *sig = [inst methodSignatureForSelector:sel];
+    if (!sig) return NO;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.target = inst;
+    inv.selector = sel;
+
+    NSString *(^fallback)(NSString *) = ^NSString *(NSString *v) { return v ?: @""; };
+    id args[6] = {
+        fallback(COVerifyLoginCode()),   fallback(COVerifyNoticeCode()),
+        fallback(COVerifyVersionCode()), fallback(COVerifyHeartbeatCode()),
+        fallback(COVerifyAppKey()),      fallback(COVerifyRSAPublicKey()),
+    };
+    for (NSUInteger i = 0; i < 6; i++) {
+        __unsafe_unretained id a = args[i];
+        [inv setArgument:&a atIndex:i + 2];
+    }
+
+    __unsafe_unretained NSError *e = nil;
+    if (sig.numberOfArguments > 8) [inv setArgument:&e atIndex:8];
+
+    [inv invoke];
+
+    // 返回值类型：T3 的 initRsa... 声明为 BOOL，但为了兼容别的实现，
+    // 这里按 methodSignature 自己报的类型来读。
+    // ★ 不写 _C_BOOL / _C_INT —— 那两个宏在 objc/runtime.h 里，
+    //   苹果 SDK 有、GNUstep 替身头没有，写了本地过不了。
+    //   直接用字符字面量：'B' = C++ bool / BOOL，'c' = char，'i' = int。
+    const char *rt = [sig methodReturnType];
+    char rc = rt ? rt[0] : '\0';
+    BOOL callOK = NO;
+    if (rc == 'B' || rc == 'c') {
+        // 标 __unsafe_unretained：getReturnValue: 直接往这块内存里写，
+        // ARC 对局部变量插的 retain/release 会把它当对象处理，栈写 + 引用计数
+        // 一起上就是未定义行为。标了才让编译器放手。
+        __unsafe_unretained BOOL boolRet = NO;
+        [inv getReturnValue:&boolRet];
+        callOK = boolRet;
+    } else if (rc == 'i' || rc == 'I' || rc == 'l' || rc == 'q') {
+        long long scalarRet = 0;
+        [inv getReturnValue:&scalarRet];
+        callOK = (scalarRet != 0);
+    }
+    if (err) *err = e;
+    return callOK;
+}
+
+/// 兼容旧版明文初始化（5 个字符串 + NSError**）
+- (void)callPlainInitOn:(id)inst selector:(SEL)sel {
     NSMethodSignature *sig = [inst methodSignatureForSelector:sel];
     if (!sig) return;
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
     inv.target = inst;
     inv.selector = sel;
 
-    id args[] = {
-        COVerifyLoginCode(), COVerifyNoticeCode(), COVerifyVersionCode(),
-        COVerifyHeartbeatCode(), COVerifyAppKey(), COVerifyRSAPublicKey()
+    NSString *(^fallback)(NSString *) = ^NSString *(NSString *v) { return v ?: @""; };
+    id args[5] = {
+        fallback(COVerifyLoginCode()), fallback(COVerifyNoticeCode()),
+        fallback(COVerifyVersionCode()), fallback(COVerifyHeartbeatCode()),
+        fallback(COVerifyAppKey()),
     };
-    // 参数 0/1 是 self/_cmd，从 2 开始
-    for (NSUInteger i = 0; i < 6; i++) {
-        id a = args[i] ?: @"";
+    for (NSUInteger i = 0; i < 5; i++) {
+        __unsafe_unretained id a = args[i];
         [inv setArgument:&a atIndex:i + 2];
     }
-    if (err) {
-        NSError *e = nil;
-        [inv setArgument:&e atIndex:8];
-    }
+    __unsafe_unretained NSError *e = nil;
+    if (sig.numberOfArguments > 7) [inv setArgument:&e atIndex:7];
     [inv invoke];
 }
 
@@ -438,20 +556,16 @@ static NSDate *COParseExpiry(NSString *s) {
 
     if (result) {
         // ── 成功标志 ──
-        // 兼容 code / status / ret / state 等多个字段名，值兼容 "1" / 1 / true / "ok"
-        id code = [self firstValueOf:result keys:@[@"code", @"status", @"ret", @"state"]];
-        NSString *codeStr = COStringOf(code);
-
-        ok = [codeStr isEqualToString:@"1"]
-          || [codeStr isEqualToString:@"200"]
-          || [codeStr isEqualToString:@"ok"]
-          || [codeStr isEqualToString:@"OK"]
-          || [codeStr isEqualToString:@"true"]
-          || [code integerValue] == 1;
+        // ★ 先读 T3LoginResult.success，再退回 code 判断。
+        //   原因见 COSuccessOfResult 的注释：T3 的失败结果上**没有 code 字段**，
+        //   只认 code 会让卡密永远验证不过。
+        NSString *codeStr = nil;
+        ok = COSuccessOfResult(result, &codeStr);
 
         // ── 提示信息 ──
-        id msg = [self firstValueOf:result keys:@[@"msg", @"message", @"info", @"errmsg"]];
-        NSString *m = COStringOf(msg);
+        // ★ T3 失败时原因在 `error` 字段，不在 `msg`。
+        //   不取 error 的话用户永远只看到"验证失败"，分不清是卡密错还是网络错。
+        NSString *m = COMessageOfResult(result);
         message = m.length ? m : (ok ? @"验证成功" : @"验证失败");
 
         if (ok) {
@@ -594,6 +708,94 @@ static NSString *COStringOf(id v) {
     if ([v isKindOfClass:[NSString class]]) return v;
     if ([v isKindOfClass:[NSNumber class]]) return [v stringValue];
     return [v description];
+}
+
+/// 从「验证结果对象」上取成功标志。
+///
+/// ★ 为什么不能直接用 codeStr 判断成功：
+///   T3 的失败路径给出的是
+///       [T3Result fail:@"卡密不存在"]     → success=NO, error=@"...", code 压根不存在
+///       [T3Result fail:@"请求失败: ..."]  → success=NO, error=@"网络..."
+///   也就是说 —— **T3 的失败结果上没有 `code` 字段**。
+///   原实现先取 code，而 T3 只有成功时（`json[@"code"]==200` 才构造 okWithData）
+///   才有 code=200；失败时 code 是 nil，`[nil integerValue] == 0` 不成立，
+///   于是 ok 恒为 NO —— 卡密再正确也永远验证不过。
+///
+///   所以正确的顺序是：**先读 success 布尔字段**，拿到了就以它为准；
+///   只有 SDK 是别的实现（没有 success 字段）时才退回 code 判断。
+static BOOL COSuccessOfResult(id result, NSString **outCodeStr) {
+    NSString *codeStr = nil;
+
+    @try {
+        // ① 首选：T3LoginResult.success（BOOL）
+        if ([result respondsToSelector:NSSelectorFromString(@"success")]) {
+            id s = [result valueForKey:@"success"];
+            if ([s isKindOfClass:[NSNumber class]]) {
+                // NSNumber 包 BOOL / 0-1 / 字符串数字 都兼容
+                NSNumber *n = (NSNumber *)s;
+                BOOL isBoolLike = (strcmp(n.objCType, @encode(BOOL)) == 0) ||
+                                  (strcmp(n.objCType, @encode(char)) == 0);
+                if (isBoolLike || [n integerValue] == 0 || [n integerValue] == 1) {
+                    if (outCodeStr) *outCodeStr = n.boolValue ? @"1" : @"0";
+                    return n.boolValue;
+                }
+            } else if ([s isKindOfClass:[NSString class]]) {
+                NSString *ls = [(NSString *)s lowercaseString];
+                BOOL v = [ls isEqualToString:@"1"] || [ls isEqualToString:@"true"] ||
+                         [ls isEqualToString:@"yes"] || [ls isEqualToString:@"ok"];
+                if (outCodeStr) *outCodeStr = v ? @"1" : @"0";
+                return v;
+            }
+        }
+    } @catch (NSException *ignored) {
+        (void)ignored;
+    }
+
+    // ② 退回：code / status / ret / state 这类数值标志
+    //    兼容 "1" / "200" / "ok" / "true"
+    id code = nil;
+    @try {
+        for (NSString *k in @[@"code", @"status", @"ret", @"state"]) {
+            if ([result respondsToSelector:NSSelectorFromString(k)]) {
+                id v = [result valueForKey:k];
+                if (v) { code = v; break; }
+            }
+        }
+    } @catch (NSException *ignored2) {
+        (void)ignored2;
+    }
+
+    codeStr = COStringOf(code);
+    if (outCodeStr) *outCodeStr = codeStr;
+
+    if (codeStr.length == 0) return NO;
+    if ([codeStr isEqualToString:@"ok"] || [codeStr isEqualToString:@"OK"] ||
+        [codeStr isEqualToString:@"true"]) {
+        return YES;
+    }
+    NSInteger c = codeStr.integerValue;
+    return c == 1 || c == 200;
+}
+
+/// 从「验证结果对象」上取失败原因。
+///
+/// ★ 同样是 T3 的形状问题：失败时文案在 `error` 字段，**不在 `msg`**。
+///   原实现只找 msg/message/info/errmsg，于是所有失败都显示成"验证失败"，
+///   用户看不到"卡密不存在"还是"网络超时" —— 也就无从判断该改卡密还是该查网络。
+static NSString *COMessageOfResult(id result) {
+    if (!result) return nil;
+    @try {
+        for (NSString *k in @[@"error", @"msg", @"message", @"info", @"errmsg"]) {
+            if (![result respondsToSelector:NSSelectorFromString(k)]) continue;
+            id v = [result valueForKey:k];
+            if (!v) continue;
+            NSString *s = COStringOf(v);
+            if (s.length) return s;
+        }
+    } @catch (NSException *ignored) {
+        (void)ignored;
+    }
+    return nil;
 }
 
 /// SDK 不可用时的降级：本地缓存还能用就放行，否则拒绝

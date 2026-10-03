@@ -39,22 +39,28 @@ static inline NSString *COVerifyRSAPublicKey(void) {
             "-----END PUBLIC KEY-----";
 }
 
-/// 验证服务器地址（← 改成你自己的域名/IP）
+/// 验证服务器地址 —— **不用配，SDK 内部已经写死了**。
 ///
-/// ★ 为什么单独列出来：
-///   参考实现 F5CloudAuth 用的是纯 IP 直连 + 自拼 HTTP 报文
-///   （__cstring 0x36659 `POST %@ HTTP/1.1` / 0x3666c `Host: %@:%ld`），
-///   这样能绕开 NSURLSession 的 ATS 限制和证书校验，也方便随时换 IP。
-///   这里给两条路：填了 baseURL 就走 NSURLSession（省事、有 TLS），
-///   只有 host+port 就走裸 socket（抗封、可换 IP）。
-static inline NSString *COVerifyBaseURL(void) {
-    // 例：@"https://verify.example.com"  留空则走 COVerifyHost/Port 的裸 socket
-    return @"";
-}
+/// ★ 别被旧注释误导（这里原来让你填域名/IP，是错的）：
+///   T3 官方 SDK 在 sdk/T3Verify.m 里硬编码了 6 个服务器，
+///   init 时用 arc4random_uniform 洗牌，请求时逐个重试，
+///   全部打不通才报「无法连接到所有T3网络验证服务器」：
+///
+///       https://w.t3yanzheng.com/
+///       https://w2.t3yanzheng.com/
+///       https://w3.t3yanzheng.com/
+///       https://w4.t3yanzheng.com/
+///       https://w5.t3yanzheng.com/
+///       https://w.t3data.net/
+///
+///   这套是 T3 自己的容灾机制（某台被打掉就自动换下一台），
+///   在外部再配一遍反而会绕开它的故障转移。所以这里不留配置项。
+///
+/// 真要换线路：改 sdk/T3Verify.m 里 T3ServerURLs() 的数组。
+/// 下面两个常量只为了让日志能看出「有几个可试的服务器」，不参与请求。
 
-/// 裸 socket 方式用的主机和端口（只在 COVerifyBaseURL 为空时生效）
-static inline NSString *COVerifyHost(void) { return @"127.0.0.1"; }
-static inline NSInteger COVerifyPort(void) { return 80; }
+/// 可用的验证服务器条数（仅供日志；请求由 SDK 自己轮询）
+static inline NSInteger COVerifyServerCount(void) { return 6; }
 
 #pragma mark - 版本 / 心跳
 
