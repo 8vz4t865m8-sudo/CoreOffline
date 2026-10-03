@@ -39,6 +39,23 @@ static inline NSString *COVerifyRSAPublicKey(void) {
             "-----END PUBLIC KEY-----";
 }
 
+/// 验证服务器地址（← 改成你自己的域名/IP）
+///
+/// ★ 为什么单独列出来：
+///   参考实现 F5CloudAuth 用的是纯 IP 直连 + 自拼 HTTP 报文
+///   （__cstring 0x36659 `POST %@ HTTP/1.1` / 0x3666c `Host: %@:%ld`），
+///   这样能绕开 NSURLSession 的 ATS 限制和证书校验，也方便随时换 IP。
+///   这里给两条路：填了 baseURL 就走 NSURLSession（省事、有 TLS），
+///   只有 host+port 就走裸 socket（抗封、可换 IP）。
+static inline NSString *COVerifyBaseURL(void) {
+    // 例：@"https://verify.example.com"  留空则走 COVerifyHost/Port 的裸 socket
+    return @"";
+}
+
+/// 裸 socket 方式用的主机和端口（只在 COVerifyBaseURL 为空时生效）
+static inline NSString *COVerifyHost(void) { return @"127.0.0.1"; }
+static inline NSInteger COVerifyPort(void) { return 80; }
+
 #pragma mark - 版本 / 心跳
 
 /// 本地版本号（字符串，与 T3 后台登记的一致；服务端版本比它大就提示更新）
@@ -121,8 +138,27 @@ static inline NSString *CoreHostBundleID(void) {
 }
 
 /// 宿主首页「社区」按钮跳转地址（← 改成你自己的）
-/// 原始测试版的值是 @"https://t.me/cheatrev"
+/// 原始测试版 / ViaOffline 用的都是 @"https://t.me/cheatrev"（Telegram 推广）
 static inline NSString *COCommunityURL(void) { return @"https://t.me/cheatrev"; }
+
+#pragma mark - 离线兜底（★ 照用户测试版的行为）
+
+/// 网络不可用 / 服务器打不通时，是否回落到「永久授权」。
+///
+/// ★ 为什么要这个开关：
+///   用户原来的测试版 CoreOffline.work.dylib 是**纯离线**的 ——
+///   它内部状态机直接吐 2099-12-31 23:59:59，从不联网，所以永远不闪退、不锁死。
+///   换成联网验证后，服务器一挂用户就被挡在门外，体验是倒退。
+///   打开这个开关（默认 YES）就保持测试版的「永不锁死」特性：
+///   联网成功 → 用服务器的真实到期时间；联网失败 → 用 COVerifyPerpetualExpiry()。
+///
+/// 关掉（NO）则变成严格模式：没网就等于没授权，适合需要真风控的场景。
+static inline BOOL COVerifyAllowOfflineFallback(void) { return YES; }
+
+/// 离线授权的宽限期（秒）。上次成功验证后多久之内断网仍算有效。
+/// 0 表示不设宽限（每次启动都必须联网成功）。
+static inline NSTimeInterval COVerifyOfflineGrace(void) { return 7 * 24 * 3600.0; }
+
 
 #pragma mark - 社群链接
 

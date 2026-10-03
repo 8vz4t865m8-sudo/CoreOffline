@@ -36,6 +36,7 @@ SRC      = src/CoreOffline.m \
            src/COVerifyBridge.m \
            src/COKeychain.m \
            src/COEntry.m \
+           src/COLog.m \
            sdk/T3Verify.m
 
 # 头文件搜索路径

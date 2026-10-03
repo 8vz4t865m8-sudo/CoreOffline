@@ -41,7 +41,7 @@ def strip_comments(t):
     return t
 
 ALL_M = ["CoreOffline.m", "COIcon.m", "COLicenseDialog.m", "COVerifyBridge.m",
-         "COKeychain.m", "COEntry.m"]
+         "COKeychain.m", "COEntry.m", "COLog.m"]
 TEXT  = {f: read(os.path.join(SRC, f)) for f in ALL_M}
 CODE  = {f: strip_comments(v) for f, v in TEXT.items()}
 

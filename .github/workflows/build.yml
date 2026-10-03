@@ -25,7 +25,7 @@ jobs:
         run: |
           set -e
           for f in src/CoreOffline.m src/COIcon.m src/COLicenseDialog.m \
-                   src/COVerifyBridge.m src/COKeychain.m src/COEntry.m; do
+                   src/COVerifyBridge.m src/COKeychain.m src/COEntry.m src/COLog.m; do
             test -f "$f" || { echo "missing $f"; exit 1; }
           done
           test -f sdk/T3Verify.m || { echo "missing sdk/T3Verify.m"; exit 1; }

@@ -14,6 +14,7 @@
 #import "COVerifyBridge.h"
 #import "COVerifyConfig.h"
 #import "COKeychain.h"
+#import "COLog.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -41,6 +42,8 @@ static NSString *const kCOKeyCard      = @"co_license_card";
 static NSString *const kCOKeyExpiry    = @"co_license_expiry";
 static NSString *const kCOKeyStateCode = @"co_license_statecode";
 static NSString *const kCOKeyEndStamp  = @"co_license_end_stamp";
+/// 最后一次「联网验证成功」的时间戳 —— 离线兜底靠它算宽限期
+static NSString *const kCOKeyLastGoodStamp = @"co_license_last_good";
 
 #pragma mark - 统一读写（三级回退）
 
@@ -84,6 +87,65 @@ static void COStoreDelete(NSString *key) {
 /// 补一个 double 的读写（到期时间戳）
 static void COStoreWriteDouble(NSString *key, double v) {
     COStoreWrite(key, [NSString stringWithFormat:@"%.6f", v]);
+}
+
+static double COStoreReadDouble(NSString *key) {
+    NSString *s = COStoreRead(key);
+    return s.length ? s.doubleValue : 0;
+}
+
+#pragma mark - 失败归因：是网络问题还是卡密问题？
+
+/// 判断一次验证失败到底是「连不上服务器」还是「卡密本身有问题」。
+///
+/// ★ 这个区分至关重要：
+///   离线兜底只能对**网络故障**生效。如果卡密是错的/过期的也兜底，
+///   那等于任何人随便填一串都能拿到永久授权 —— 验证就白做了。
+///
+/// 判据（任一命中就算网络故障）：
+///   1. message 里出现网络类关键词
+///   2. code 是负数或 0（T3 的网络错误码约定）
+///   3. result 对象上带了 NSError 且 domain 是 NSURLErrorDomain
+///   4. result 为 nil（SDK 压根没返回）
+static BOOL COIsNetworkFailure(NSString *message, NSString *codeStr, id result) {
+    // ── 1. message 关键词 ──
+    if (message.length) {
+        NSArray<NSString *> *needles = @[
+            @"网络", @"超时", @"连接", @"服务器", @"无响应", @"timeout",
+            @"network", @"connect", @"offline", @"unreachable",
+            @"NSURLError", @"-100", @"request timed out",
+        ];
+        NSString *lower = message.lowercaseString;
+        for (NSString *n in needles) {
+            if ([message rangeOfString:n].location != NSNotFound) return YES;
+            if ([lower rangeOfString:n.lowercaseString].location != NSNotFound) return YES;
+        }
+    }
+
+    // ── 2. 错误码约定 ──
+    if (codeStr.length) {
+        NSInteger c = codeStr.integerValue;
+        // 负数（-1 / -1009...）和 0 都当网络问题；1/200 是成功，别的正数是业务错误
+        if (c <= 0 && codeStr.length <= 6 && [codeStr rangeOfCharacterFromSet:
+             [[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
+            return YES;
+        }
+    }
+
+    // ── 3. result 上挂的 NSError ──
+    @try {
+        if ([result respondsToSelector:NSSelectorFromString(@"error")]) {
+            id err = [result valueForKey:@"error"];
+            if ([err isKindOfClass:[NSError class]]) {
+                NSError *e = (NSError *)err;
+                if ([e.domain isEqualToString:NSURLErrorDomain]) return YES;
+            }
+        }
+    } @catch (NSException *ignored) { /* KVC 失败就当没这个字段 */
+        (void)ignored;
+    }
+
+    return NO;
 }
 
 #pragma mark - 时间解析
@@ -427,14 +489,70 @@ static NSDate *COParseExpiry(NSString *s) {
             }
             [self saveCacheCard:card expiry:expiry stateCode:stateCode];
             _loggedIn = YES;
+            // ★ 记下这次成功的时间，离线兜底要用它算宽限期
+            COStoreWriteDouble(kCOKeyLastGoodStamp, [NSDate date].timeIntervalSince1970);
 
             __weak typeof(self) ws2 = self;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [ws2 startHeartbeat];
             });
+        } else {
+            // ── 失败：区分「网络故障」和「卡密错误」 ──
+            //
+            // 只有网络类失败才允许离线兜底。
+            // 卡密错误（"卡密不存在"/"已过期"）绝不能兜底 —— 那等于白送授权。
+            if (COVerifyAllowOfflineFallback() && COIsNetworkFailure(message, codeStr, result)) {
+                NSString *cached = [self cachedExpiry];
+                double lastGood = COStoreReadDouble(kCOKeyLastGoodStamp);
+                double age = lastGood > 0 ? ([NSDate date].timeIntervalSince1970 - lastGood) : DBL_MAX;
+                BOOL inGrace = (COVerifyOfflineGrace() <= 0) || (age <= COVerifyOfflineGrace());
+
+                if (inGrace) {
+                    // 有历史成功记录且在宽限期内 → 用缓存的到期时间续命
+                    expiry = cached.length ? cached : COVerifyPerpetualExpiry();
+                    stateCode = COStoreRead(kCOKeyStateCode);
+                    _loggedIn = YES;
+                    ok = YES;
+                    message = @"网络不可用，已使用本地授权";
+                    CORecord("license.offline_fallback grace=1 age=%.0f", age);
+
+                    __weak typeof(self) ws3 = self;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [ws3 startHeartbeat];
+                    });
+                } else if (COVerifyOfflineGrace() <= 0 || lastGood <= 0) {
+                    // 从没成功过 / 没设宽限 → 默认放行到远期
+                    // （这就是用户测试版的行为：永不锁死）
+                    expiry = COVerifyPerpetualExpiry();
+                    _loggedIn = YES;
+                    ok = YES;
+                    message = @"离线模式";
+                    CORecord("license.offline_fallback grace=0 first_run");
+                } else {
+                    message = message.length ? message : @"网络不可用且授权已超出宽限期";
+                    CORecord("license.offline_fallback denied age=%.0f", age);
+                }
+            }
         }
     } else {
+        // result 为 nil：SDK 没返回任何东西，按网络故障处理
         message = @"验证服务无响应";
+        if (COVerifyAllowOfflineFallback()) {
+            NSString *cached = [self cachedExpiry];
+            if (cached.length) {
+                expiry = cached;
+                _loggedIn = YES;
+                ok = YES;
+                message = @"验证服务无响应，已使用本地授权";
+                CORecord("license.nil_result_fallback");
+            } else {
+                expiry = COVerifyPerpetualExpiry();
+                _loggedIn = YES;
+                ok = YES;
+                message = @"离线模式";
+                CORecord("license.nil_result_perpetual");
+            }
+        }
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -443,8 +561,7 @@ static NSDate *COParseExpiry(NSString *s) {
 }
 
 /// 从结果对象上安全取属性（KVC，字段名变化时不崩）
-- (id)valueOf:(id)obj key:(NSString *)key {
-    @try {
+- (id)valueOf:(id)obj key:(NSString *)key {    @try {
         if ([obj respondsToSelector:NSSelectorFromString(key)]) {
             return [obj valueForKey:key];
         }

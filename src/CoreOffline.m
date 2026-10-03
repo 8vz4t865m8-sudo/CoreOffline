@@ -29,31 +29,32 @@
 
 #import "COTheme.h"
 #import "COIcon.h"
+#import "COLog.h"
 #import "COVerifyBridge.h"
 #import "COVerifyConfig.h"
 #import "COKeychain.h"
 #import "COLicenseDialog.h"
 
 #pragma mark - 日志 (对应 record / logFD)
+//
+// ★ 日志实现已抽到 COLog.m（COVerifyBridge 也要用）。
+//   保留 record 这个名字做薄封装 —— 本文件几十处调用不用改，
+//   调用风格也跟参考实现 F5CloudAuth 一致。
 
-static int gLogFD = -1;
-
-static void CoreLogOpen(void) {
-    if (gLogFD >= 0) return;
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/core-offline.log"];
-    gLogFD = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (gLogFD < 0) gLogFD = STDERR_FILENO;
-}
+static void record(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void record(const char *fmt, ...) {
-    if (gLogFD < 0) CoreLogOpen();
-    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
+    char buf[1024];
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    strlcat(buf, "\n", sizeof(buf));
-    write(gLogFD, buf, strlen(buf));
+    CORecord("%s", buf);
+}
+
+static void CoreLogOpen(void) {
+    // 兼容旧调用点：确保 fd 已打开
+    (void)CORecordFD();
 }
 
 #pragma mark - 全局状态

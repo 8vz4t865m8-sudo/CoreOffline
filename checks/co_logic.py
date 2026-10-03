@@ -28,7 +28,9 @@ CO = code(os.path.join(SRC, "CoreOffline.m"))
 DL = code(os.path.join(SRC, "COLicenseDialog.m"))
 BR = code(os.path.join(SRC, "COVerifyBridge.m"))
 IC = code(os.path.join(SRC, "COIcon.m"))
-CFG = read(os.path.join(INC, "COVerifyConfig.h"))
+# ★ 配置头一律用「剥注释版」CFG_CODE：
+#   拿含注释的原文去查字面量，会把注释里举的例子也算成违规 —— J23 就这么误报过。
+CFG_CODE = code(os.path.join(INC, "COVerifyConfig.h"))
 
 P, F = [], []
 def ok(m): P.append(m)
@@ -204,20 +206,22 @@ else:
 # ── J21 网络配置里的凭据必须与配置头一致（不能两边各写一份）
 for name, pat in [("loginCode", r"0AAD3A3337741A5B"),
                   ("appkey", r"1e45cd9daa2d5d7dfc6d8e66abe43b0a")]:
-    if re.search(pat, CFG):
+    if re.search(pat, CFG_CODE):
         ok(f"J21 配置含 {name}")
     else:
         bad(f"J21 配置缺 {name}")
 
 # ── J22 设备 ID 不能依赖 IDFA
-if "advertisingIdentifier" not in CFG and "ASIdentifierManager" not in CFG:
+if "advertisingIdentifier" not in CFG_CODE and "ASIdentifierManager" not in CFG_CODE:
     ok("J22 设备 ID 不依赖 IDFA（无需 ATT 授权）")
 else:
     bad("J22 设备 ID 用了 IDFA —— 未授权时会拿到全 0")
 
 # ── J23 配置头里不能出现裸的 2099（必须走命名常量）
 #      （常量定义本身那一行除外）
-lines = CFG.splitlines()
+#   ★ 用剥注释版：注释里举例说明"原测试版吐 2099"是合法的，
+#     拿含注释的原文去查会误报。
+lines = CFG_CODE.splitlines()
 bad_lines = [l for l in lines
              if "2099" in l and not re.search(r"static inline NSString \*COVerifyPerpetualExpiry", l)
              and 'return @"2099' not in l]
@@ -227,8 +231,8 @@ else:
     bad(f"J23 配置里 2099 散落：{bad_lines}")
 
 # ── J24 未授权哨兵与永久卡值必须不同（否则永久卡被判未授权）
-m1 = re.search(r'COVerifyPerpetualExpiry\(void\)\s*\{\s*return\s*@"([^"]+)"', CFG)
-m2 = re.search(r'COVerifyUnauthorizedExpiry\(void\)\s*\{\s*return\s*@"([^"]+)"', CFG)
+m1 = re.search(r'COVerifyPerpetualExpiry\(void\)\s*\{\s*return\s*@"([^"]+)"', CFG_CODE)
+m2 = re.search(r'COVerifyUnauthorizedExpiry\(void\)\s*\{\s*return\s*@"([^"]+)"', CFG_CODE)
 if m1 and m2 and m1.group(1) != m2.group(1):
     ok(f"J24 哨兵({m2.group(1)}) ≠ 永久卡({m1.group(1)})")
 else:
@@ -374,6 +378,75 @@ if not ctor_hits:
     ok("N8 constructor 早期路径没碰 Security/CFNetwork")
 else:
     bad(f"N8 constructor 早期路径出现 {ctor_hits} —— 会闪退")
+
+# ══════════════════════════════════════════════════════════════════════
+#  O. 离线兜底（保住用户测试版「永不锁死」的行为）
+# ══════════════════════════════════════════════════════════════════════
+#
+#  用户原话：「我用原来我那个测试版就不会闪退」——
+#  原测试版是纯离线的（硬编码 2099），服务器挂了照样能用。
+#  加了联网验证之后，必须保住这个特性，否则一断网用户就被挡在门外。
+
+# ── O1 兜底开关必须存在且默认开
+if re.search(r"COVerifyAllowOfflineFallback\(void\)\s*\{\s*return\s+YES", CFG_CODE):
+    ok("O1 离线兜底开关存在且默认开启")
+else:
+    bad("O1 缺 COVerifyAllowOfflineFallback（或默认值不是 YES）—— 断网就锁死")
+
+# ── O2 宽限期必须可配
+if re.search(r"COVerifyOfflineGrace\(void\)\s*\{\s*return\s+[\d\.]+\s*\*", CFG_CODE) or \
+   re.search(r"COVerifyOfflineGrace\(void\)\s*\{\s*return\s+[\d\.]+", CFG_CODE):
+    ok("O2 离线宽限期可配")
+else:
+    bad("O2 缺 COVerifyOfflineGrace —— 每次启动都必须联网，体验倒退")
+
+# ── O3 兜底前必须区分「网络故障」和「卡密错误」
+if "COIsNetworkFailure" in BR:
+    ok("O3 兜底前做失败归因（COIsNetworkFailure）")
+else:
+    bad("O3 没做失败归因 —— 卡密错也能兜底 = 随便填都过")
+
+# ── O4 卡密类错误绝不能兜底
+#      判据：兜底调用点必须被 COIsNetworkFailure 包住
+if re.search(r"COVerifyAllowOfflineFallback\(\)\s*&&\s*COIsNetworkFailure", BR):
+    ok("O4 兜底被 COIsNetworkFailure 短路，卡密错不会放行")
+else:
+    bad("O4 兜底没被失败归因包住 —— 卡密错误可能白送授权")
+
+# ── O5 必须记录「最后一次成功时间」才能算宽限
+if "kCOKeyLastGoodStamp" in BR and re.search(r"COStoreWriteDouble\(kCOKeyLastGoodStamp", BR):
+    ok("O5 记录最后一次联网成功时间（宽限期依据）")
+else:
+    bad("O5 没记录最后成功时间 —— 宽限期算不出来")
+
+# ── O6 成功路径才写 lastGood（失败不能刷新宽限）
+#      否则连不上服务器反而把宽限一直续下去
+ok_writes = re.findall(r"COStoreWriteDouble\(kCOKeyLastGoodStamp", BR)
+if len(ok_writes) == 1:
+    ok("O6 lastGood 只在成功路径写一次（失败不会续宽限）")
+elif len(ok_writes) > 1:
+    bad(f"O6 lastGood 被写了 {len(ok_writes)} 次 —— 失败路径也刷的话宽限永远续下去")
+else:
+    bad("O6 找不到 lastGood 写入点")
+
+# ── O7 result 为 nil（SDK 没返回）也要有兜底
+if re.search(r"nil_result_fallback|nil_result_perpetual", BR):
+    ok("O7 SDK 返回 nil 时也有兜底（不锁死）")
+else:
+    bad("O7 SDK 返回 nil 直接判失败 —— 宿主会卡在未授权")
+
+# ── O8 兜底必须写日志（线上排查唯一手段）
+n_fb_logs = len(re.findall(r'CORecord\("license\.(offline_fallback|nil_result)', BR))
+if n_fb_logs >= 3:
+    ok(f"O8 兜底路径有 {n_fb_logs} 条日志（可线上排查）")
+else:
+    bad(f"O8 兜底日志只有 {n_fb_logs} 条 —— 出问题查不到")
+
+# ── O9 服务器地址必须可配（换 IP 不用重新编译逻辑）
+if "COVerifyBaseURL" in CFG_CODE and "COVerifyHost" in CFG_CODE and "COVerifyPort" in CFG_CODE:
+    ok("O9 服务器地址可配（baseURL + host/port 两条路）")
+else:
+    bad("O9 服务器地址写死 —— 换服务器要改代码")
 
 print()
 print("=" * 74)
