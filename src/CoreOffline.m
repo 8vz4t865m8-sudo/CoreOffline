@@ -18,6 +18,9 @@
 #import <objc/message.h>
 #import <dispatch/dispatch.h>
 #import <mach-o/dyld.h>
+// mach_continuous_time 在这里声明（原来漏了，真机 SDK 上直接 undeclared）。
+// mach-o/dyld.h 只给 dyld 那套，不含 mach 时间函数。
+#import <mach/mach_time.h>
 #import <unistd.h>
 #import <fcntl.h>
 #import <stdarg.h>
@@ -297,15 +300,26 @@ static void CoreHomeRewriteControls(UIView *root) {
                 ?: btn.accessibilityLabel;
             if (CoreHomeMatchesTitle(text)) {
                 [btn removeTarget:nil action:NULL forControlEvents:UIControlEventAllEvents];
+
+                // ★ showsMenuAsPrimaryAction 与 enumerateEventHandlers: 都是 iOS 14+。
+                //   原来 showsMenuAsPrimaryAction 落在 @available 块外面 ——
+                //   编译不报错（属性赋值），但 iOS 13 设备上会 unrecognized selector 崩。
+                //   两个都收进同一个版本判断里。
                 if (@available(iOS 14.0, *)) {
+                    // 真实签名是 5 个参数：
+                    //   (UIAction *, id element, SEL, UIControlEvents, BOOL *stop)
+                    // 之前写成 3 个（UIAction/元素/stop），真机上 block 类型不匹配编不过。
                     [btn enumerateEventHandlers:^(UIAction *action,
-                                                  __kindof UIMenuElement *element,
+                                                  id element,
+                                                  SEL selector,
+                                                  UIControlEvents events,
                                                   BOOL *stop) {
-                        (void)element; (void)stop;
+                        (void)element; (void)selector; (void)events; (void)stop;
                         [btn removeAction:action forControlEvents:UIControlEventTouchUpInside];
                     }];
+                    btn.showsMenuAsPrimaryAction = NO;
                 }
-                btn.showsMenuAsPrimaryAction = NO;
+
                 [btn addTarget:[CoreHomeLinkTarget sharedTarget]
                         action:@selector(openCommunity:)
               forControlEvents:UIControlEventTouchUpInside];
