@@ -58,8 +58,14 @@ if not _HAS_SHIM:
     print("      （CI 上属正常，本地跑请先搭好替身头）")
 else:
     for f in ALL_M:
+        # ★ -Werror=implicit-function-declaration 是必须的：
+        #   替身头（/tmp/uishim）比真 SDK 宽容，很多系统函数（_dyld_image_count、
+        #   sysctlbyname...）在替身头里"碰巧"可见，本地不报错但 CI 直接编译失败。
+        #   打开这个开关后本地就能提前抓到 —— 这是踩过的坑，别关掉。
         cmd = ["clang", "-fsyntax-only", "-fblocks", "-fobjc-arc",
-               "-fobjc-runtime=gnustep-2.0", "-std=gnu11", "-Wno-everything"] + INC + \
+               "-fobjc-runtime=gnustep-2.0", "-std=gnu11", "-Wno-everything",
+               "-Werror=implicit-function-declaration",
+               "-Werror=int-conversion"] + INC + \
               [os.path.join(SRC, f)]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0:

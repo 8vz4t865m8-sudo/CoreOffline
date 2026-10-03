@@ -86,11 +86,6 @@ static void COStoreWriteDouble(NSString *key, double v) {
     COStoreWrite(key, [NSString stringWithFormat:@"%.6f", v]);
 }
 
-static double COStoreReadDouble(NSString *key) {
-    NSString *s = COStoreRead(key);
-    return s.length ? s.doubleValue : 0;
-}
-
 #pragma mark - 时间解析
 
 /// 支持的全部日期格式。

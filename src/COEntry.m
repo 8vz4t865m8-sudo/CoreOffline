@@ -22,8 +22,15 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/sysctl.h>
+#import <sys/proc.h>
 #import <dlfcn.h>
 #import <unistd.h>
+// _dyld_image_count / _dyld_get_image_name —— 注入检测要用
+#import <mach-o/dyld.h>
+// ★ CFNetwork 必须显式 import：
+//   缺了它 CFNetworkCopySystemProxySettings 会被当成返回 int（隐式声明），
+//   64 位指针被截断成 32 位 —— 编译只是一条警告，运行时直接崩。
+#import <CFNetwork/CFNetwork.h>
 
 #pragma mark - 线程安全的结果缓冲
 //

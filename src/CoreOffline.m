@@ -605,7 +605,7 @@ static void CoreStartLicenseSubsystem(void) {
     gLicenseSubsystemUp = YES;
 
     record("license.subsystem.start sdk=%d keychain=%d",
-           (int)bridge.available, (int)CoreKeychainAvailable());
+           (int)bridge.available, (int)COKeychainAvailable());
 
     CoreCheckLicense();
 }
