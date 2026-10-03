@@ -31,6 +31,7 @@
 #import "COIcon.h"
 #import "COVerifyBridge.h"
 #import "COVerifyConfig.h"
+#import "COKeychain.h"
 #import "COLicenseDialog.h"
 
 #pragma mark - 日志 (对应 record / logFD)
@@ -588,12 +589,24 @@ static void CoreStartLicenseSubsystem(void) {
         CorePresentLicenseDialog();
     };
 
+    // ★ C 入口层用通知来请求弹窗（COEntry.m 的 coreoffline_c_present_dialog）。
+    //   走通知而不是导出函数指针：免得把 static 函数暴露成外部符号。
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"CoreOfflinePresentLicense"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        record("entry.present_dialog via notification");
+        CorePresentLicenseDialog();
+    }];
+
     // ★ 置位必须在 shared 建好之后、CoreCheckLicense 之前 ——
     //   CoreCheckLicense 会走 CoreLicenseExpiryString，
     //   而那个函数靠这个标志决定「能不能读缓存」。
     gLicenseSubsystemUp = YES;
 
-    record("license.subsystem.start sdk=%d", (int)bridge.available);
+    record("license.subsystem.start sdk=%d keychain=%d",
+           (int)bridge.available, (int)CoreKeychainAvailable());
+
     CoreCheckLicense();
 }
 

@@ -13,30 +13,169 @@
 
 #import "COVerifyBridge.h"
 #import "COVerifyConfig.h"
+#import "COKeychain.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 
 #pragma mark - 本地存储 key
+//
+//  ★ 存储位置的选择（照 F5CloudAuth 的做法）：
+//
+//    主存储  = Keychain（Service = <bundleid>.license，Account = 下面这些 key）
+//               · 用户清缓存不失效
+//               · 不落明文磁盘
+//               · AfterFirstUnlockThisDeviceOnly —— 后台心跳能读，不随备份迁移
+//
+//    副本    = Documents/.syscache/<sha256(key)>（带 salt 校验）
+//               · 防「只清 Keychain 就白嫖」的破解工具
+//               · 读到副本时自动回填 Keychain
+//
+//    兜底    = NSUserDefaults
+//               · Keychain 完全不可用时（无签名环境）保底
+//
+//    读顺序：Keychain → 文件副本 → NSUserDefaults
+//    写：三处都写（COVault 写前两处，再补 NSUserDefaults）
+//
 
 static NSString *const kCOKeyCard      = @"co_license_card";
 static NSString *const kCOKeyExpiry    = @"co_license_expiry";
 static NSString *const kCOKeyStateCode = @"co_license_statecode";
 static NSString *const kCOKeyEndStamp  = @"co_license_end_stamp";
 
+#pragma mark - 统一读写（三级回退）
+
+static NSString *COStoreRead(NSString *key) {
+    // 1) COVault 内部已做 Keychain → 文件 的回退 + 自愈
+    NSString *v = COVaultRead(key);
+    if (v.length) return v;
+
+    // 2) NSUserDefaults 兜底
+    NSString *ud = [[NSUserDefaults standardUserDefaults] stringForKey:key];
+    if (ud.length) {
+        // 从旧存储迁移过来：抢在 Keychain 可用时补写一份
+        COVaultWrite(key, ud);
+        return ud;
+    }
+    return nil;
+}
+
+static void COStoreDelete(NSString *key);
+
+static void COStoreWrite(NSString *key, NSString *value) {
+    if (value.length == 0) {
+        COStoreDelete(key);
+        return;
+    }
+    COVaultWrite(key, value);
+    // NSUserDefaults 也写一份：某些越狱环境 Keychain 不可用，
+    // 文件又可能因沙箱限制写不进去，三保险。
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:value forKey:key];
+    [d synchronize];
+}
+
+static void COStoreDelete(NSString *key) {
+    COVaultDelete(key);
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d removeObjectForKey:key];
+    [d synchronize];
+}
+
+/// 补一个 double 的读写（到期时间戳）
+static void COStoreWriteDouble(NSString *key, double v) {
+    COStoreWrite(key, [NSString stringWithFormat:@"%.6f", v]);
+}
+
+static double COStoreReadDouble(NSString *key) {
+    NSString *s = COStoreRead(key);
+    return s.length ? s.doubleValue : 0;
+}
+
 #pragma mark - 时间解析
 
-/// "yyyy-MM-dd HH:mm:ss" → NSDate。失败返回 nil。
+/// 支持的全部日期格式。
+///
+/// ★ 照 F5CloudAuth 的做法：真实服务器返回的时间格式**不统一**，
+///   同一个后端的公告接口和登录接口可能给出不同格式，
+///   甚至同一接口在不同版本之间会变。所以这里做多格式轮询 + 正则兜底，
+///   而不是死磕一种格式。
+static NSArray<NSString *> *CODateFormatList(void) {
+    static NSArray *formats = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        formats = @[
+            @"yyyy-MM-dd HH:mm:ss",
+            @"yyyy/MM/dd HH:mm:ss",
+            @"yyyy-MM-dd'T'HH:mm:ss",
+            @"yyyy-MM-dd'T'HH:mm:ssZ",
+            @"yyyy-MM-dd HH:mm",
+            @"yyyy/MM/dd HH:mm",
+            @"yyyyMMddHHmmss",
+            @"yyyyMMddHHmm",
+            @"yyyy-MM-dd",
+        ];
+    });
+    return formats;
+}
+
+/// 一次性把多格式都试一遍。返回第一个解析成功且**合理**的日期。
 static NSDate *COParseExpiry(NSString *s) {
     if (s.length == 0) return nil;
+
+    NSString *trimmed = [s stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return nil;
+
+    // ★ 纯数字的时间戳也认（秒 / 毫秒）
+    if (trimmed.length >= 10 && trimmed.length <= 13 && [trimmed rangeOfCharacterFromSet:
+        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
+        double v = trimmed.doubleValue;
+        // 13 位当毫秒
+        if (trimmed.length >= 13) v /= 1000.0;
+        // 合理的 Unix 时间范围：2001-01-01 ~ 2100-01-01
+        if (v > 978307200.0 && v < 4102444800.0) {
+            return [NSDate dateWithTimeIntervalSince1970:v];
+        }
+    }
+
     static NSDateFormatter *f = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         f = [[NSDateFormatter alloc] init];
+        // ★ en_US_POSIX：避免用户在系统里改成泰国佛历 / 日本和历之后解析错乱
         f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
         f.timeZone = [NSTimeZone localTimeZone];
     });
-    return [f dateFromString:s];
+
+    for (NSString *fmt in CODateFormatList()) {
+        f.dateFormat = fmt;
+        NSDate *d = [f dateFromString:trimmed];
+        if (d) return d;
+    }
+
+    // ── 正则兜底：从一坨文本里抠出日期 ──
+    // 对应 F5CloudAuth 的 (?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}(...)?
+    static NSRegularExpression *re = nil;
+    static dispatch_once_t once2;
+    dispatch_once(&once2, ^{
+        re = [NSRegularExpression
+              regularExpressionWithPattern:@"(?:19|20)\\d{2}[-/]\\d{1,2}[-/]\\d{1,2}"
+                                   options:0
+                                     error:NULL];
+    });
+
+    NSTextCheckingResult *m = [re firstMatchInString:trimmed
+                                             options:0
+                                               range:NSMakeRange(0, trimmed.length)];
+    if (m) {
+        NSString *dateOnly = [trimmed substringWithRange:m.range];
+        NSString *norm = [dateOnly stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
+        f.dateFormat = @"yyyy-MM-dd";
+        NSDate *d = [f dateFromString:norm];
+        if (d) return d;
+    }
+
+    return nil;
 }
 
 @interface COVerifyBridge ()
@@ -73,34 +212,29 @@ static NSDate *COParseExpiry(NSString *s) {
 #pragma mark - 缓存读写
 
 - (void)loadCache {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    _cachedCardStore   = [d stringForKey:kCOKeyCard];
-    _cachedExpiryStore = [d stringForKey:kCOKeyExpiry];
+    _cachedCardStore   = COStoreRead(kCOKeyCard);
+    _cachedExpiryStore = COStoreRead(kCOKeyExpiry);
 }
 
 - (void)saveCacheCard:(NSString *)card expiry:(NSString *)expiry stateCode:(NSString *)stateCode {
     _cachedCardStore   = [card copy];
     _cachedExpiryStore = [expiry copy];
 
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setObject:card forKey:kCOKeyCard];
-    [d setObject:expiry forKey:kCOKeyExpiry];
-    if (stateCode) [d setObject:stateCode forKey:kCOKeyStateCode];
+    COStoreWrite(kCOKeyCard, card);
+    COStoreWrite(kCOKeyExpiry, expiry);
+    if (stateCode.length) COStoreWrite(kCOKeyStateCode, stateCode);
 
     NSDate *end = COParseExpiry(expiry);
-    if (end) [d setDouble:end.timeIntervalSince1970 forKey:kCOKeyEndStamp];
-    [d synchronize];
+    if (end) COStoreWriteDouble(kCOKeyEndStamp, end.timeIntervalSince1970);
 }
 
 - (void)clearCache {
     _cachedCardStore = nil;
     _cachedExpiryStore = nil;
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d removeObjectForKey:kCOKeyCard];
-    [d removeObjectForKey:kCOKeyExpiry];
-    [d removeObjectForKey:kCOKeyStateCode];
-    [d removeObjectForKey:kCOKeyEndStamp];
-    [d synchronize];
+    COStoreDelete(kCOKeyCard);
+    COStoreDelete(kCOKeyExpiry);
+    COStoreDelete(kCOKeyStateCode);
+    COStoreDelete(kCOKeyEndStamp);
 }
 
 - (NSString *)cachedExpiry {
@@ -246,22 +380,50 @@ static NSDate *COParseExpiry(NSString *s) {
     NSString *expiry = nil, *stateCode = nil, *message = nil;
 
     if (result) {
-        // T3LoginResult: code / msg / endTime / statecode / kamiId ...
-        id code = [self valueOf:result key:@"code"];
-        id msg  = [self valueOf:result key:@"msg"];
-        NSString *codeStr = [code isKindOfClass:[NSString class]] ? code : [code stringValue];
+        // ── 成功标志 ──
+        // 兼容 code / status / ret / state 等多个字段名，值兼容 "1" / 1 / true / "ok"
+        id code = [self firstValueOf:result keys:@[@"code", @"status", @"ret", @"state"]];
+        NSString *codeStr = COStringOf(code);
 
-        // SDK 约定：code 为 "1" 或 1 表示成功
-        ok = [codeStr isEqualToString:@"1"] || [code integerValue] == 1;
+        ok = [codeStr isEqualToString:@"1"]
+          || [codeStr isEqualToString:@"200"]
+          || [codeStr isEqualToString:@"ok"]
+          || [codeStr isEqualToString:@"OK"]
+          || [codeStr isEqualToString:@"true"]
+          || [code integerValue] == 1;
 
-        NSString *m = [msg isKindOfClass:[NSString class]] ? msg : nil;
+        // ── 提示信息 ──
+        id msg = [self firstValueOf:result keys:@[@"msg", @"message", @"info", @"errmsg"]];
+        NSString *m = COStringOf(msg);
         message = m.length ? m : (ok ? @"验证成功" : @"验证失败");
 
         if (ok) {
-            id et = [self valueOf:result key:@"endTime"];
-            expiry = [et isKindOfClass:[NSString class]] ? et : nil;
-            id sc = [self valueOf:result key:@"statecode"];
-            stateCode = [sc isKindOfClass:[NSString class]] ? sc : [sc stringValue];
+            // ── 到期时间：多字段候选 ──
+            // T3 主要用 endTime；这里把 F5CloudAuth 见过的名字也一并兼容，
+            // 后端换实现时不用改代码。
+            id et = [self firstValueOf:result keys:@[
+                @"endTime", @"end_time", @"expire", @"expires_at",
+                @"expireTime", @"endtime", @"dqsj", @"viptime",
+                @"vip_time", @"expires_in", @"lease_ttl",
+            ]];
+            expiry = COStringOf(et);
+
+            // 服务端可能给时间戳（秒/毫秒）而不是字符串
+            if (expiry.length && [expiry rangeOfCharacterFromSet:
+                 [[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
+                double v = expiry.doubleValue;
+                if (expiry.length >= 13) v /= 1000.0;
+                if (v > 978307200.0 && v < 4102444800.0) {
+                    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+                    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+                    f.timeZone = [NSTimeZone localTimeZone];
+                    f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+                    expiry = [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:v]];
+                }
+            }
+
+            id sc = [self firstValueOf:result keys:@[@"statecode", @"state_code", @"stateCode"]];
+            stateCode = COStringOf(sc);
 
             if (expiry.length == 0) {
                 // 服务端没给到期时间：按「长期有效」处理，给一个远期值，
@@ -295,6 +457,31 @@ static NSDate *COParseExpiry(NSString *s) {
         // 字段不存在就返回 nil
     }
     return nil;
+}
+
+/// 在多个候选 key 里找第一个有值的（照 F5CloudAuth 的兼容策略）
+///
+/// 为什么需要：不同版本的 T3 后端返回的字段名不一样。
+/// F5CloudAuth 同时兼容了 expires_at / dqsj / expire / end_time / endtime /
+/// lease_ttl / expires_in 这么多名字 —— 说明真实环境里字段名确实会变。
+- (id)firstValueOf:(id)obj keys:(NSArray<NSString *> *)keys {
+    for (NSString *k in keys) {
+        id v = [self valueOf:obj key:k];
+        if (v) {
+            // 空字符串当没有
+            if ([v isKindOfClass:[NSString class]] && [v length] == 0) continue;
+            return v;
+        }
+    }
+    return nil;
+}
+
+/// 统一转成字符串
+static NSString *COStringOf(id v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:[NSString class]]) return v;
+    if ([v isKindOfClass:[NSNumber class]]) return [v stringValue];
+    return [v description];
 }
 
 /// SDK 不可用时的降级：本地缓存还能用就放行，否则拒绝

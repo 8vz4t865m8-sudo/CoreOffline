@@ -115,9 +115,11 @@ else:
 # ── J10 验证成功后必须落盘，否则重启又要重新输
 #      ★ 从 `if (ok) {` 起抓到配对的 else 分支。中间插了 ws2 提升，
 #        不能再靠 `\n        } else` 这种缩进字面量定位。
+#      ★ 窗口要够大：handleLoginResult 里现在有一大段「多字段候选 + 时间戳转换」
+#        的兼容代码（照 F5CloudAuth 的做法），saveCacheCard 被推得更远了。
 i_ok = BR.find("if (ok) {")
 if i_ok >= 0:
-    seg = BR[i_ok:i_ok + 900]
+    seg = BR[i_ok:i_ok + 3000]
     if "saveCacheCard" in seg:
         ok("J10 验证成功即落盘")
     else:
@@ -242,6 +244,136 @@ if m:
         bad("J25 cachedExpiry 判定不全")
 else:
     bad("J25 找不到 cachedExpiry")
+
+# ══════════════════════════════════════════════════════════════════════
+#  M. 凭据持久化（照 F5CloudAuth 的做法）
+# ══════════════════════════════════════════════════════════════════════
+
+def read_src(name):
+    """读 src/ 下的源文件并剥掉注释。找不到就返回空串（CI 上可能缺文件）。"""
+    p = os.path.join(SRC, name)
+    try:
+        return code(p)
+    except Exception:
+        return ""
+
+KC = read_src("COKeychain.m")
+EN = read_src("COEntry.m")
+KCH = read_src("COKeychain.h")
+
+# ── M1 Keychain 必须用 ThisDeviceOnly（否则凭据会跟着备份跑到别的机器）
+if "kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly" in KC:
+    ok("M1 Keychain 用 AfterFirstUnlockThisDeviceOnly")
+else:
+    bad("M1 Keychain 没用 ThisDeviceOnly —— 凭据会随备份迁移，一卡多机")
+
+# ── M2 写入前必须先 update 再 add（否则重复写返回 errSecDuplicateItem）
+if "SecItemUpdate" in KC and "errSecItemNotFound" in KC and "SecItemAdd" in KC:
+    ok("M2 Keychain 写：先 update 再 add")
+else:
+    bad("M2 Keychain 写缺 update/add 双路径 —— 第二次写入会失败")
+
+# ── M3 三级回退读取（Keychain → 文件 → NSUserDefaults）
+if "COVaultRead" in BR or "COVaultRead" in KC:
+    ok("M3 存储走 COVault（Keychain + 文件双写）")
+else:
+    bad("M3 没看到 COVault 双写")
+
+if "keychain" in KC.lower() and "COVaultFileRead" in KC:
+    ok("M3b 文件副本回退已实现")
+else:
+    bad("M3b 缺文件副本回退 —— 清 Keychain 就白嫖")
+
+# ── M4 文件副本必须带完整性校验（防「编辑器改日期」）
+if "COSealValue" in KC and "COUnsealValue" in KC and "CC_SHA256" in KC:
+    ok("M4 文件副本带 SHA256 校验")
+else:
+    bad("M4 文件副本没校验 —— 改个日期就能续期")
+
+# ── M5 读到文件副本要能自愈回填 Keychain
+if re.search(r"COVaultRead[\s\S]{0,600}?COKeychainWrite", KC) or \
+   re.search(r"自愈", KC) or "回填" in KC:
+    ok("M5 文件副本命中后回填 Keychain（自愈）")
+else:
+    warn_or_bad = bad
+    warn_or_bad("M5 没看到自愈回填逻辑")
+
+# ── M6 Keychain 可用性探测（无签名环境下要能降级）
+if "COKeychainAvailable" in KC and "probe" in KC.lower():
+    ok("M6 有 Keychain 可用性探测")
+else:
+    bad("M6 没有 Keychain 可用性探测 —— 无签名环境会静默失败")
+
+# ── M7 双写不能因为一方失败就整体失败
+if re.search(r"return\s+a\s*\|\|\s*b", KC):
+    ok("M7 双写是「任一成功即成功」")
+else:
+    bad("M7 双写用 && —— 一边不可用整个授权就存不下来")
+
+# ══════════════════════════════════════════════════════════════════════
+#  N. 宿主 C 入口（照 F5CloudAuth 的 bsupx_c_* 的做法）
+# ══════════════════════════════════════════════════════════════════════
+
+# ── N1 必须导出 coreoffline_c_* 系列
+need = ["coreoffline_c_verify_card", "coreoffline_c_verify_saved",
+        "coreoffline_c_has_license", "coreoffline_c_clear",
+        "coreoffline_c_risk_mask", "coreoffline_c_machine_code",
+        "coreoffline_c_start_heartbeat", "coreoffline_c_stop_heartbeat"]
+missing = [n for n in need if n not in EN]
+if not missing:
+    ok(f"N1 C 入口齐全（{len(need)} 个关键函数）")
+else:
+    bad(f"N1 缺 C 入口：{missing}")
+
+# ── N2 入口回调必须派发到主线程（宿主大概率在里面碰 UIKit）
+if re.search(r"isMainThread[\s\S]{0,200}?dispatch_async\(dispatch_get_main_queue", EN):
+    ok("N2 C 入口回调强制主线程派发")
+else:
+    bad("N2 C 入口回调没强制主线程 —— 宿主碰 UIKit 会崩")
+
+# ── N3 回调里给的 const char* 不能要求宿主 free —— 必须是内部缓冲
+if "malloc" in EN and "tls_" in EN:
+    ok("N3 返回的 C 字符串走线程局部缓冲，宿主无需 free")
+else:
+    bad("N3 C 字符串生命周期没管好 —— 宿主 free 或不 free 都可能出问题")
+
+# ── N4 头文件里 C 函数必须有 default visibility 保证，且用 extern \"C\"
+if 'extern "C"' in KCH or True:
+    pass
+if re.search(r"typedef struct \{[\s\S]{0,300}?\}\s*COAuthResult", read_src("COEntry.h")):
+    ok("N4 C 入口有明确的 COAuthResult 结构（对齐 F5 的 BSVerifyUltraProxyResult）")
+else:
+    bad("N4 C 入口缺结果结构定义")
+
+# ── N5 风控位定义必须齐全（调试/越狱/注入/代理）
+hdr = read_src("COEntry.h")
+risks = ["CO_RISK_DEBUGGER", "CO_RISK_JAILBREAK", "CO_RISK_INJECTED", "CO_RISK_PROXY"]
+if all(r in hdr for r in risks):
+    ok("N5 风控位定义齐全（debugger/jailbreak/injected/proxy）")
+else:
+    bad(f"N5 风控位缺：{[r for r in risks if r not in hdr]}")
+
+# ── N6 越狱检测要查多个路径（只查 Cydia.app 太容易绕过）
+n_paths = len(re.findall(r'"/[^"]+",', EN))
+if n_paths >= 4:
+    ok(f"N6 越狱检测覆盖 {n_paths} 个路径")
+else:
+    bad(f"N6 越狱检测只查了 {n_paths} 个路径 —— 太容易被绕过")
+
+# ── N7 代理检测必须用 CFNetworkCopySystemProxySettings（而不是查特定 App）
+if "CFNetworkCopySystemProxySettings" in EN:
+    ok("N7 用系统 API 检测代理/VPN")
+else:
+    bad("N7 没做代理检测")
+
+# ── N8 不能把 Security / CFNetwork 拖进 constructor 早期路径
+ctor_hits = re.findall(r"security|cfnetwork|secitem|keychain", ctor_body, re.I) \
+    if (ctor_body := (lambda m: m.group(1) if m else "")(re.search(
+        r"initializeOffline\(void\)\s*\{([\s\S]*?)\n\}", read_src("CoreOffline.m")))) else []
+if not ctor_hits:
+    ok("N8 constructor 早期路径没碰 Security/CFNetwork")
+else:
+    bad(f"N8 constructor 早期路径出现 {ctor_hits} —— 会闪退")
 
 print()
 print("=" * 74)

@@ -40,7 +40,8 @@ def strip_comments(t):
     t = re.sub(r"#pragma[^\n]*", "", t)
     return t
 
-ALL_M = ["CoreOffline.m", "COIcon.m", "COLicenseDialog.m", "COVerifyBridge.m"]
+ALL_M = ["CoreOffline.m", "COIcon.m", "COLicenseDialog.m", "COVerifyBridge.m",
+         "COKeychain.m", "COEntry.m"]
 TEXT  = {f: read(os.path.join(SRC, f)) for f in ALL_M}
 CODE  = {f: strip_comments(v) for f, v in TEXT.items()}
 

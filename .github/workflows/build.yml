@@ -24,7 +24,8 @@ jobs:
       - name: Static sanity check
         run: |
           set -e
-          for f in src/CoreOffline.m src/COIcon.m src/COLicenseDialog.m src/COVerifyBridge.m; do
+          for f in src/CoreOffline.m src/COIcon.m src/COLicenseDialog.m \
+                   src/COVerifyBridge.m src/COKeychain.m src/COEntry.m; do
             test -f "$f" || { echo "missing $f"; exit 1; }
           done
           test -f sdk/T3Verify.m || { echo "missing sdk/T3Verify.m"; exit 1; }
@@ -85,11 +86,31 @@ jobs:
             || { echo "❌ 缺 QuartzCore"; exit 1; }
           echo "✅ QuartzCore ok"
 
-          echo "── 注入安全性断言：constructor 里不许有 NSUserDefaults / T3Verify 直接调用"
-          if nm -u CoreOffline.work.dylib | grep -q "NSUserDefaults"; then
-            echo "⚠️  有 NSUserDefaults 未定义符号（可能来自 COVerifyBridge，属预期）"
-          fi
-          echo "✅ 检查完成"
+          echo "── Security 断言（Keychain + RSA 用，COKeychain.m 依赖）"
+          otool -L CoreOffline.work.dylib | grep -q "Security.framework" \
+            || { echo "❌ 缺 Security —— COKeychain 会链接失败"; exit 1; }
+          echo "✅ Security ok"
+
+          echo "── CFNetwork 断言（CFNetworkCopySystemProxySettings 代理检测用）"
+          otool -L CoreOffline.work.dylib | grep -q "CFNetwork" \
+            || { echo "❌ 缺 CFNetwork —— 代理检测会链接失败"; exit 1; }
+          echo "✅ CFNetwork ok"
+
+          echo "── C 入口符号断言（宿主 dlsym 用，必须导出）"
+          for sym in coreoffline_c_verify_card coreoffline_c_verify_saved \
+                     coreoffline_c_has_license coreoffline_c_risk_mask \
+                     coreoffline_c_machine_code coreoffline_c_clear; do
+            nm -gU CoreOffline.work.dylib | grep -q "_$sym\$" \
+              || { echo "❌ 缺导出符号 _$sym"; exit 1; }
+          done
+          echo "✅ 13 个 C 入口至少 6 个关键符号已导出"
+
+          echo "── Keychain 符号断言（必须链上 Security 的 SecItem* 系列）"
+          nm -u CoreOffline.work.dylib | grep -q "_SecItemAdd" \
+            || { echo "❌ 没链上 SecItemAdd —— COKeychain 没被编进去？"; exit 1; }
+          nm -u CoreOffline.work.dylib | grep -q "_SecItemCopyMatching" \
+            || { echo "❌ 没链上 SecItemCopyMatching"; exit 1; }
+          echo "✅ Keychain 符号 ok"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

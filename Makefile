@@ -29,11 +29,13 @@ LIPO      = xcrun -sdk $(SDK) lipo
 
 OUT      = CoreOffline.work.dylib
 
-# 源码清单：dylib 本体 + 主题/图标/桥接/弹窗
+# 源码清单：dylib 本体 + 主题/图标/桥接/弹窗 + 密钥链 + C 入口
 SRC      = src/CoreOffline.m \
            src/COIcon.m \
            src/COLicenseDialog.m \
            src/COVerifyBridge.m \
+           src/COKeychain.m \
+           src/COEntry.m \
            sdk/T3Verify.m
 
 # 头文件搜索路径
@@ -43,11 +45,15 @@ INC      = -Iinclude -Isrc -Isdk
 #   Foundation / UIKit  —— 基础
 #   CoreGraphics        —— COIcon 手绘矢量图标（CGContext 那套）
 #   QuartzCore          —— CABasicAnimation，提交按钮里的转圈动画
-#   Security            —— T3 SDK 的 RSA 公钥解密
-#   CommonCrypto 不需要单独链，跟随 Security 一起进来（CC_MD5）
+#   Security            —— T3 SDK 的 RSA 公钥解密 + Keychain（COKeychain）
+#                          + CommonCrypto（CC_SHA256）随它一起进来
+#   CFNetwork           —— CFNetworkCopySystemProxySettings（代理/VPN 检测）
+#
+# ★ CFNetwork 是 F5CloudAuth 有、原测试版没有的 —— 加它是为了风控自检。
+#   注意：这两个框架都**不能**在 constructor 早期路径里碰（见 co_ctor.py 的 H 节）。
 FRAMEWORKS = -framework Foundation -framework UIKit \
              -framework CoreGraphics -framework QuartzCore \
-             -framework Security
+             -framework Security -framework CFNetwork
 
 # 公共编译参数（不含架构选择 —— 架构用 -target 逐个指定）
 COMMON   = -dynamiclib -fobjc-arc -O2 -Wall -Wno-unused-variable \
