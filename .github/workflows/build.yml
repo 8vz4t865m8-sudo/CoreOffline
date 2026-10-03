@@ -164,16 +164,29 @@ jobs:
 
           echo
           echo "════════ 关键字符串断言 ════════"
+          # ★ 这里必须与 src/CoreOffline.m 里实际使用的选择器一一对应。
+          #   v3 的主接管点是 QXA117 finish:authorized:message:expiresAt:
+          #   —— v2 时代的 verifyDeviceIdentifier:completion: 已经不再 hook，
+          #   所以它**不应该**出现在二进制里（也不该出现在这份清单里）。
           for s in "qingxiugai.qingxiugai.qinxiugai" "2099-12-31 23:59:59" \
                    "QXA117" "QXA140" "QXA141" "QxF4" \
                    "finish:authorized:message:expiresAt:" \
-                   "verifyDeviceIdentifier:completion:" \
                    "performPurpose:rootDeviceId:payload:completion:" \
                    "inputCard:transfer:" "qxRefreshExpiry"; do
             strings -a CoreOffline.work.dylib | grep -q "$s" \
               || { echo "❌ 缺关键字符串: $s"; exit 1; }
           done
-          echo "✅ 宿主类名 / 方法名 / 到期常量齐全"
+          echo "✅ 宿主类名 / 方法名（4 个接管点）/ 到期常量齐全"
+
+          # 反向断言：已废弃的 hook 目标不能回到二进制里，
+          # 否则说明源码被改回了 v2 的旧路径（那个版本会自己调 block → 闪退）。
+          for s in "verifyDeviceIdentifier:completion:"; do
+            if strings -a CoreOffline.work.dylib | grep -q "$s"; then
+              echo "❌ 出现已废弃的选择器: $s —— 源码可能被改回了 v2 路径"
+              exit 1
+            fi
+          done
+          echo "✅ 未回退到 v2 的 verifyDeviceIdentifier: 路径"
 
           echo
           echo "════════ 反模式断言（源码层面已查过，这里查二进制）════════"
